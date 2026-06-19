@@ -136,16 +136,74 @@ for group_name, group_dirs in groups.items():
                         st.error(str(e))
 
 # 添加新目录
+import os as _os
+from pathlib import Path as _Path
+
 st.subheader("➕ 添加监控目录")
+
+# --- 目录浏览器 ---
+with st.expander("📂 浏览本地目录", expanded=False):
+    if "browse_path" not in st.session_state:
+        home = str(_Path.home())
+        st.session_state.browse_path = home
+        st.session_state.browse_selected = home
+
+    # 导航按钮
+    current = st.session_state.browse_path
+    parent = str(_Path(current).parent)
+
+    bc1, bc2, bc3 = st.columns([1, 2, 1])
+    with bc1:
+        if st.button("🏠 主目录"):
+            st.session_state.browse_path = str(_Path.home())
+            st.rerun()
+    with bc2:
+        st.text_input("当前路径", value=current, disabled=True, key="cur_browse")
+    with bc3:
+        if st.button("📁 上级目录"):
+            st.session_state.browse_path = parent
+            st.rerun()
+
+    # 列出子目录
+    try:
+        entries = sorted(
+            [e for e in _os.listdir(current) if _os.path.isdir(_os.path.join(current, e))
+             and not e.startswith(".")]
+        )
+        if entries:
+            cols_per_row = 3
+            for i in range(0, len(entries), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for j, name in enumerate(entries[i:i+cols_per_row]):
+                    full = _os.path.join(current, name)
+                    with row_cols[j]:
+                        if st.button(f"📁 {name[:20]}", key=f"browse_{full}"):
+                            st.session_state.browse_path = full
+                            st.rerun()
+        else:
+            st.caption("此目录下没有子目录。")
+
+        # 选择当前目录
+        if st.button(f"✅ 选择: {current}", type="primary"):
+            st.session_state.browse_selected = current
+    except PermissionError:
+        st.warning("没有权限访问此目录。")
+
+# --- 输入区 ---
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
-    new_path = st.text_input("目录路径", placeholder="~/Documents/Work/", key="new_dir_path")
+    default_path = st.session_state.get("browse_selected", str(_Path.home()))
+    new_path = st.text_input(
+        "目录路径", value=default_path, placeholder="~/Documents/Work/", key="new_dir_path"
+    )
 with c2:
-    new_group = st.selectbox("分组", ["工作", "生活", "默认"] + list(groups.keys()), key="new_dir_group")
+    existing = list(groups.keys())
+    all_groups = ["工作", "生活", "默认"] + [g for g in existing if g not in ("工作", "生活", "默认")]
+    new_group = st.selectbox("分组", all_groups, key="new_dir_group")
 with c3:
     new_recursive = st.checkbox("递归扫描", value=True)
 
-if st.button("➕ 添加目录"):
+if st.button("➕ 添加目录", type="primary"):
     if new_path:
         try:
             r = requests.post(f"{API_BASE}/settings", json={

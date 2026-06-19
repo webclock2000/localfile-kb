@@ -303,7 +303,14 @@ def graph_endpoint(
     kb: str = Query(default="默认"),
 ):
     kb = _resolve_kb(request, kb)
-    return _kb_gs(request, kb).expand(entity, hops=hop)
+    gs = _kb_gs(request, kb)
+    # Fuzzy search first
+    matches = gs.search_entities(entity, limit=10)
+    if not matches:
+        return {"nodes": [], "edges": []}
+    # Pick the best match (shortest name that contains the query)
+    best = min(matches, key=len)
+    return gs.expand(best, hops=hop)
 
 
 # ============================================================================
