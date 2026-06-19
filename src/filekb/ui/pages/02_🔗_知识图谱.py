@@ -6,6 +6,21 @@ import networkx as nx
 
 API_BASE = "http://localhost:9494"
 
+
+def _to_dot(G, center):
+    """NetworkX → DOT for graphviz rendering."""
+    lines = ["digraph G {", "  rankdir=LR;",
+             '  node [shape=ellipse, style=filled, fillcolor="#e8f0fe"];']
+    for node in G.nodes():
+        color = "#fff9c4" if center in node else "#e8f0fe"
+        lines.append(f'  "{node}" [fillcolor="{color}" label="{node}"];')
+    for u, v, data in G.edges(data=True):
+        pred = data.get("predicate", "")
+        lines.append(f'  "{u}" -> "{v}" [label="{pred}"];')
+    lines.append("}")
+    return "\n".join(lines)
+
+
 st.set_page_config(page_title="FileKB — 知识图谱", page_icon="🔗", layout="wide")
 st.title("🔗 知识图谱浏览")
 st.caption("探索知识库中实体之间的关联关系。支持模糊搜索。")
@@ -61,15 +76,3 @@ if entity_query:
         st.error(f"出错了: {e}")
 else:
     st.info("输入一个实体名称来探索知识图谱。支持模糊搜索——输入「遥感」即可匹配「遥感原理与方法」。")
-
-def _to_dot(G, center):
-    lines = ["digraph G {", "  rankdir=LR;",
-             '  node [shape=ellipse, style=filled, fillcolor="#e8f0fe"];']
-    for node in G.nodes():
-        color = "#fff9c4" if center in node else "#e8f0fe"
-        lines.append(f'  "{node}" [fillcolor="{color}" label="{node}"];')
-    for u, v, data in G.edges(data=True):
-        pred = data.get("predicate", "")
-        lines.append(f'  "{u}" -> "{v}" [label="{pred}"];')
-    lines.append("}")
-    return "\n".join(lines)

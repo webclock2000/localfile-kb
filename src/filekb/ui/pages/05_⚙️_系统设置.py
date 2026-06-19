@@ -136,16 +136,38 @@ for group_name, group_dirs in groups.items():
                         st.error(str(e))
 
 # 添加新目录
+import subprocess
+
 st.subheader("➕ 添加监控目录")
 
-c1, c2, c3 = st.columns([2, 1, 1])
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 with c1:
-    new_path = st.text_input("目录路径", placeholder="~/Documents/Work/", key="new_dir_path")
+    # 如果 session_state 里有选中的路径就用它
+    default_path = st.session_state.get("picked_dir", "")
+    new_path = st.text_input("目录路径", value=default_path, placeholder="~/Documents/Work/", key="new_dir_path")
 with c2:
+    st.caption("")  # 对齐占位
+    if st.button("📁…", help="打开系统文件夹选择对话框"):
+        try:
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'POSIX path of (choose folder with prompt "选择要监控的目录：")'],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                picked = result.stdout.strip()
+                st.session_state.picked_dir = picked
+                st.rerun()
+            elif result.returncode != 0:
+                # 用户取消了对话框
+                pass
+        except Exception:
+            pass
+with c3:
     existing = list(groups.keys())
     all_groups = ["工作", "生活", "默认"] + [g for g in existing if g not in ("工作", "生活", "默认")]
     new_group = st.selectbox("分组", all_groups, key="new_dir_group")
-with c3:
+with c4:
     new_recursive = st.checkbox("递归扫描", value=True)
 
 if st.button("➕ 添加目录", type="primary"):
