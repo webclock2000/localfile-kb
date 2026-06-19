@@ -285,7 +285,7 @@ def ui(port: int):
     ui_dir = Path(__file__).parent / "ui"
     click.echo(f"Starting FileKB UI on http://localhost:{port}")
     subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(ui_dir / "chat.py"),
+        [sys.executable, "-m", "streamlit", "run", str(ui_dir / "app.py"),
          "--server.port", str(port)],
     )
 

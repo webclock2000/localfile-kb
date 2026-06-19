@@ -1,0 +1,9 @@
+[client]
+# 隐藏 Deploy 按钮，只保留最小工具栏
+toolbarMode = "minimal"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
