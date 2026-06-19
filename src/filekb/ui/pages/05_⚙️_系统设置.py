@@ -136,32 +136,11 @@ for group_name, group_dirs in groups.items():
                         st.error(str(e))
 
 # 添加新目录
-import subprocess as _sp
-from pathlib import Path as _Path
-
 st.subheader("➕ 添加监控目录")
-
-# 快捷目录
-st.caption("快捷选择：")
-quick_dirs = {
-    "🏠 主目录": str(_Path.home()),
-    "📄 文稿": str(_Path.home() / "Documents"),
-    "🖥 桌面": str(_Path.home() / "Desktop"),
-    "📥 下载": str(_Path.home() / "Downloads"),
-}
-cols = st.columns(len(quick_dirs))
-for i, (label, dpath) in enumerate(quick_dirs.items()):
-    with cols[i]:
-        if st.button(label, key=f"quick_{dpath}"):
-            st.session_state.new_dir_path = dpath
-            st.rerun()
 
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
-    path_val = st.session_state.get("new_dir_path", str(_Path.home()))
-    new_path = st.text_input(
-        "目录路径", value=path_val, placeholder="~/Documents/Work/", key="new_dir_path_input"
-    )
+    new_path = st.text_input("目录路径", placeholder="~/Documents/Work/", key="new_dir_path")
 with c2:
     existing = list(groups.keys())
     all_groups = ["工作", "生活", "默认"] + [g for g in existing if g not in ("工作", "生活", "默认")]
