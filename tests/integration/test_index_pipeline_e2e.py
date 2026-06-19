@@ -39,6 +39,7 @@ def store():
 
 def test_full_pipeline(llm, store):
     """Parse a Markdown file → extract facts → store → rebuild indices → search."""
+    configure(backend="omlx")
     from filekb.embed import embed_fact
 
     # 1. Create + parse a test document
