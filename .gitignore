@@ -1,0 +1,45 @@
+# Bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Runtime data (never in repo — lives at ~/.filekb/)
+*.db
+*.log
+.faiss_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# Misc
+*.pyc
+__pycache__/
+.python-version
+
+# Models (downloaded at runtime, not committed)
+models/
+tests/e2e_real_dir.py
+.ruff_cache/

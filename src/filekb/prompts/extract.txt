@@ -1,0 +1,74 @@
+Extract a knowledge graph from the document. Return a JSON object with key
+"facts" containing 0-15 atomic relationship facts. Each fact is ONE edge:
+a (subject) --[predicate]--> (object) triple plus human-readable context.
+Long, dense documents (articles, papers, profiles) typically warrant 8-15
+facts; short or generic pages 0-3.
+
+The single most important rule -- THIS DRIVES GRAPH CONNECTIVITY:
+subject and object MUST be canonical ENTITIES or short atomic VALUES, never
+prose. They are graph nodes: the same entity must come out identical every
+time so edges connect. Put narrative, evidence and nuance in the description,
+NOT in subject/object.
+
+subject / object rules:
+- Use the shortest canonical name of a real entity: a person, organisation,
+ product/model, dataset, method, paper, place, technology, or a concrete
+ atomic value (a date, a number+unit, a version, a metric score).
+- Strip articles, roles, and qualifiers: "the Jina AI team" -> "Jina AI";
+ "a model called jina-embeddings-v3" -> "jina-embeddings-v3".
+- Use the canonical surface form, not a pronoun or paraphrase. Reuse the exact
+ same string for the same entity across every fact (this is how nodes merge).
+- Never put a sentence or clause in subject/object. If the value is inherently
+ descriptive (e.g. "trained on 2B multilingual tokens"), make object the
+ atomic value ("2B multilingual tokens") and explain in description.
+- Prefer relationships that link TWO named entities (entity-entity edges) --
+ these are what make the graph rich. Entity-value edges are fine too.
+
+Each fact:
+ {
+ "title": " ",
+ "description": "<2-3 sentences <=350 chars carrying the answer + evidence: entities, relation, value, date/number/source detail, and an inline verbatim quote when it disambiguates. Avoid restating the title verbatim.>",
+ "subject": " ",
+ "predicate": " ",
+ "object": " ",
+ "evidence_span": " ",
+ "confidence": <0..100 integer>,
+ "tags": [" ", ...]
+ }
+Coverage priorities -- extract a fact for EACH of the following when grounded in the text:
+- Every named person + their role / position / affiliation (even if named once).
+- Every named organisation, product, model, dataset, or method + how it relates
+ to other named entities (built_by, based_on, trained_on, outperforms, part_of).
+- Every concrete date/version + the event or release it marks.
+- Every named place + what happened or is located there.
+- Every quantitative result: metric scores, sizes, token counts, speedups,
+ prices -- as entity --[has_metric/scored]--> value edges.
+- Every cross-entity relationship: X built Y, X based on Y, X collaborated with
+ Y, X acquired Y, X cites Y, X compared against Y.
+Anti-patterns -- do NOT do these:
+- Don't put descriptive sentences into subject or object. That creates dead-end
+ nodes that never connect. Keep nodes short and canonical.
+- Don't only extract facts about the dominant entity. Secondary entities named
+ once still warrant their own edge.
+- Don't fill the budget with generic boilerplate (tagline, copyright, nav) at
+ the expense of specific, connectable relationships deeper in the body.
+Predicate guidance:
+- Always choose the MOST precise snake_case predicate (<=32 chars) for the actual
+ relation -- accuracy matters more than reusing a known term. Coin a new one
+ freely whenever it fits better.
+- The following are only EXAMPLES of the style/granularity (NOT a fixed list,
+ NOT a menu to pick from): built_by, based_on, trained_on, fine_tuned_from,
+ released_on, outperforms, evaluated_on, scored, integrates_with, acquired_by,
+ authored_by, cites, position_held, successor_of, used_for. Do not force a
+ relation into one of these if a more specific predicate describes it better.
+- AVOID vague catch-alls like affiliated_with or related_to.
+Title and description constraints (CRITICAL -- items violating these are dropped):
+- title and description MUST read as natural standalone fact statements.
+- They MUST NOT mention the document, the dataset, or this task.
+Fact constraints:
+- Favor specificity (proper nouns, versions, numbers) over generic claims.
+- Skip the doc entirely (return empty facts list) for navigation pages, login
+ walls, error pages, very short or generic content.
+- evidence_span must be a verbatim substring of the doc text supplied above.
+
+Output ONLY the JSON object.

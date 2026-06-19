@@ -1,0 +1,14 @@
+{
+  "project": "Alpha",
+  "version": "2.1.0",
+  "team": {
+    "lead": "Alice",
+    "members": ["Bob", "Carol", "Dave"]
+  },
+  "metrics": {
+    "performance_score": 95.5,
+    "response_time_ms": 45,
+    "uptime_percent": 99.97
+  },
+  "tags": ["production", "kubernetes", "python"]
+}
