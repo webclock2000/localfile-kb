@@ -499,6 +499,108 @@ def logs_endpoint(
 
 
 # ============================================================================
+# Settings API
+# ============================================================================
+
+
+class SettingsResponse(BaseModel):
+    llm: dict = {}
+    embedding: dict = {}
+    ocr: dict = {}
+    directories: list[dict] = []
+    extraction: dict = {}
+
+
+@app.get("/settings")
+def settings_get(request: Request):
+    """Return current configuration for the settings UI."""
+    cfg = request.app.state.config
+    return {
+        "llm": {
+            "base_url": cfg.llm.base_url,
+            "model": cfg.llm.model,
+            "timeout": cfg.llm.timeout,
+            "context_window": cfg.llm.context_window,
+        },
+        "embedding": {
+            "backend": cfg.embedding.backend,
+            "model": cfg.embedding.model,
+            "omxl_url": cfg.embedding.omxl_url,
+        },
+        "ocr": {
+            "enabled": cfg.ocr.enabled,
+            "languages": cfg.ocr.languages,
+            "min_confidence": cfg.ocr.min_confidence,
+        },
+        "directories": [
+            {
+                "path": d.path,
+                "group": d.group,
+                "recursive": d.recursive,
+                "exclude_patterns": d.exclude_patterns,
+            }
+            for d in cfg.directories
+        ],
+        "extraction": {
+            "rounds": cfg.extraction.rounds,
+            "max_chars_per_chunk": cfg.extraction.max_chars_per_chunk,
+        },
+    }
+
+
+class SettingsUpdateRequest(BaseModel):
+    section: str  # "llm" | "embedding" | "ocr" | "directories"
+    data: dict
+
+
+@app.post("/settings")
+def settings_update(req: SettingsUpdateRequest, request: Request):
+    """Update configuration and persist to config.yaml."""
+    import yaml
+
+    cfg = request.app.state.config
+    config_path = Path(
+        request.app.state.config.database.path
+    ).expanduser().parent / "config.yaml"
+
+    # Update the in-memory config
+    if req.section == "llm":
+        cfg.llm.base_url = req.data.get("base_url", cfg.llm.base_url)
+        cfg.llm.model = req.data.get("model", cfg.llm.model)
+        cfg.llm.timeout = req.data.get("timeout", cfg.llm.timeout)
+    elif req.section == "embedding":
+        cfg.embedding.backend = req.data.get("backend", cfg.embedding.backend)
+        cfg.embedding.model = req.data.get("model", cfg.embedding.model)
+        cfg.embedding.omxl_url = req.data.get("omxl_url", cfg.embedding.omxl_url)
+    elif req.section == "ocr":
+        cfg.ocr.enabled = req.data.get("enabled", cfg.ocr.enabled)
+        cfg.ocr.languages = req.data.get("languages", cfg.ocr.languages)
+    elif req.section == "directories":
+        action = req.data.get("action", "add")
+        if action == "add":
+            from filekb.config import DirectoryConfig
+            cfg.directories.append(DirectoryConfig(
+                path=req.data["path"],
+                group=req.data.get("group", "默认"),
+                recursive=req.data.get("recursive", True),
+                exclude_patterns=req.data.get("exclude_patterns", [".git", "__pycache__", ".DS_Store"]),
+            ))
+        elif action == "remove":
+            target = req.data.get("path", "")
+            cfg.directories = [d for d in cfg.directories if d.path != target]
+
+    # Persist to YAML
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg.model_dump(), f, allow_unicode=True, default_flow_style=False)
+    except Exception as e:
+        logger.warning("Failed to persist config: %s", e)
+
+    return {"status": "ok", "section": req.section}
+
+
+# ============================================================================
 # POST /entities/reject
 # ============================================================================
 

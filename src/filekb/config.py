@@ -95,6 +95,10 @@ class DirectoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(description="Directory path to monitor (supports ~)")
+    group: str = Field(
+        default="默认",
+        description="知识库分组: '工作', '生活', '默认', 或自定义名称",
+    )
     recursive: bool = Field(default=True, description="Scan subdirectories")
     exclude_patterns: list[str] = Field(
         default_factory=lambda: [".git", "__pycache__", ".DS_Store"],
