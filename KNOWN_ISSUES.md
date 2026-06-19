@@ -7,47 +7,23 @@
 
 ## P0 — 必须修复 (影响核心功能正确性)
 
-### 1. 图谱仅存在于内存，重启即丢失
+### ~~1. 图谱仅存在于内存，重启即丢失~~ ✅ 已修复 (c698329)
 
-**现状**: `graph_store.py` 中的 NetworkX DiGraph 只在 FastAPI 进程内存中。服务重启后完全空白，需要重新从 SQLite 重建。
+> 现在 server.py 启动时自动调用 `_rebuild_graph()` 从 SQLite 重建。
+> `/status` 和 `/graph` 端点均返回真实数据（当前 164 节点/122 边）。
 
-**需要做**:
-- 每次查询时从 SQLite 惰性重建（当前重建 <2秒，可接受）
-- 或 pickle 序列化热缓存到 `~/.filekb/graph.pickle`
-- 索引完成后自动触发重建
-- 当前 server.py 的 `/status` 返回 `nodes: 0`，因为 graph_store 从未被 populate
+### ~~2. 流式回答是模拟的，并非真正的 SSE~~ ✅ 已修复 (39b5951)
 
-**涉及文件**: `graph_store.py`, `server.py`, `query.py`
-
-### 2. 流式回答是模拟的，并非真正的 SSE
-
-**现状**: `server.py` 的 `/ask/stream` 端点拿到完整 answer 后按空格分词逐 token 发送。用户看到的是"逐词出现"，而非 LLM 真正的逐 token 流式输出。
-
-**需要做**:
-- `llm.py` 中的 `chat()` 方法需要支持 `stream=True`
-- oMLX 的 `/chat/completions` 已支持 SSE streaming (`"stream": true`)
-- 用 `httpx.stream()` 消费 SSE 事件流
-- 每个 `data: {"choices":[{"delta":{"content":"..."}}]}` 即为一个 token
-- 将每个 token 通过 FastAPI 的 `StreamingResponse` 转发给前端
-
-**涉及文件**: `llm.py`, `server.py`, `ui/chat.py`
+> `llm.py` 新增 `chat_stream()` 方法，消费 oMLX 真实 SSE 事件流。
+> `server.py` 的 `/ask/stream` 改为逐 token 转发。
 
 ---
 
 ## P1 — 重要功能缺失
 
-### 3. 集成测试未实现
+### ~~3. 集成测试未实现~~ ✅ 已修复 (19f7531)
 
-**现状**: `tests/integration/__init__.py` 为空文件。DEVELOPMENT_V3.md §14.2 要求的 5 个集成测试一个都没写。
-
-**需要做**:
-- `test_index_pipeline_e2e.py` — 索引测试语料库，验证 fact → DB → FAISS → graph 全链路
-- `test_fault_isolation.py` — 注入坏 chunk，验证其他文件不受影响，DLQ 包含坏 chunk
-- `test_checkpoint_resume.py` — 索引中杀进程 → 重启 → 从 checkpoint 恢复 → 无重复 fact
-- `test_query_feedback.py` — 提问 → 踩 → 重问 → ranking 变化
-- `test_chinese_extraction.py` — 中文内容 → extract_zh.txt → 实体边界正确
-
-**涉及文件**: `tests/integration/`
+> 5 个集成测试全部实现并通过（含真实 LLM 调用）。112 个测试通过。
 
 ### 4. 前端未对接图谱数据
 
