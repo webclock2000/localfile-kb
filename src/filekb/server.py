@@ -43,8 +43,13 @@ def _kb_faiss_dir(base_dir: str, kb_name: str) -> str:
 
 
 def _collect_kb_groups(cfg: Config) -> dict[str, list[dict]]:
-    """Group directories by their KB group."""
+    """Group directories by their KB group. Include KBs from kb_meta even if empty."""
     groups: dict[str, list[dict]] = {}
+
+    # Seed from kb_meta (KBs may exist without directories yet)
+    for name in cfg.kb_meta:
+        groups.setdefault(name, [])
+
     for d in cfg.directories:
         g = d.group or "默认"
         groups.setdefault(g, []).append({
@@ -52,8 +57,11 @@ def _collect_kb_groups(cfg: Config) -> dict[str, list[dict]]:
             "recursive": d.recursive,
             "exclude_patterns": d.exclude_patterns,
         })
-    if not groups:
+
+    # Always ensure "默认" exists
+    if "默认" not in groups:
         groups["默认"] = []
+
     return groups
 
 
@@ -504,7 +512,10 @@ def settings_get(request: Request):
         "directories": [{"path": d.path, "group": d.group, "recursive": d.recursive,
                          "exclude_patterns": d.exclude_patterns} for d in cfg.directories],
         "extraction": {"rounds": cfg.extraction.rounds, "max_chars_per_chunk": cfg.extraction.max_chars_per_chunk},
-        "kb_names": request.app.state.kb_names,
+        "kb_names": sorted(set(
+            list(cfg.kb_meta.keys()) + [d.group or "默认" for d in cfg.directories] + ["默认"]
+        )),
+        "kb_meta": {name: meta.model_dump() for name, meta in cfg.kb_meta.items()},
     }
 
 
@@ -528,15 +539,56 @@ def settings_update(req: SettingsUpdateRequest, request: Request):
     elif req.section == "directories":
         action = req.data.get("action", "add")
         if action == "add":
-            from filekb.config import DirectoryConfig
+            from filekb.config import DirectoryConfig, KBInfo
+            group = req.data.get("group", "默认")
             cfg.directories.append(DirectoryConfig(
-                path=req.data["path"], group=req.data.get("group", "默认"),
+                path=req.data["path"], group=group,
                 recursive=req.data.get("recursive", True),
                 exclude_patterns=req.data.get("exclude_patterns", [".git", "__pycache__", ".DS_Store"]),
             ))
+            # Auto-create KB metadata for new group names
+            if group not in cfg.kb_meta:
+                cfg.kb_meta[group] = KBInfo(description="")
         elif action == "remove":
             target = req.data.get("path", "")
             cfg.directories = [d for d in cfg.directories if d.path != target]
+    elif req.section == "knowledge_bases":
+        action = req.data.get("action", "")
+        if action == "create":
+            from filekb.config import KBInfo
+            name = req.data.get("name", "").strip()
+            if not name:
+                raise HTTPException(400, "KB name is required")
+            if name in cfg.kb_meta:
+                raise HTTPException(409, f"KB '{name}' already exists")
+            cfg.kb_meta[name] = KBInfo(description=req.data.get("description", ""))
+        elif action == "rename":
+            old_name = req.data.get("old_name", "")
+            new_name = req.data.get("new_name", "").strip()
+            if not old_name or not new_name:
+                raise HTTPException(400, "old_name and new_name are required")
+            if old_name not in cfg.kb_meta and old_name != "默认":
+                pass  # 允许裸 group（仅存在于目录中但不在 kb_meta）
+            if new_name in cfg.kb_meta:
+                raise HTTPException(409, f"KB '{new_name}' already exists")
+            # Update kb_meta
+            if old_name in cfg.kb_meta:
+                meta = cfg.kb_meta.pop(old_name)
+                cfg.kb_meta[new_name] = meta
+            # Update all directories with the old group
+            for d in cfg.directories:
+                if d.group == old_name:
+                    d.group = new_name
+        elif action == "delete":
+            name = req.data.get("name", "")
+            if not name:
+                raise HTTPException(400, "KB name is required")
+            if name == "默认":
+                raise HTTPException(400, "不能删除默认知识库")
+            # Remove all directories in this group
+            cfg.directories = [d for d in cfg.directories if d.group != name]
+            # Remove kb_meta entry
+            cfg.kb_meta.pop(name, None)
 
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)

@@ -89,6 +89,14 @@ class EmbeddingConfig(BaseModel):
     )
 
 
+class KBInfo(BaseModel):
+    """Knowledge base metadata — light metadata keyed by KB name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(default="", description="KB description for display")
+
+
 class DirectoryConfig(BaseModel):
     """Per-directory monitoring configuration."""
 
@@ -332,6 +340,7 @@ class Config(BaseModel):
 
     llm: LLMConfig = LLMConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
+    kb_meta: dict[str, KBInfo] = Field(default_factory=dict, description="KB metadata by name")
     directories: list[DirectoryConfig] = Field(default_factory=list)
     extraction: ExtractionConfig = ExtractionConfig()
     query: QueryConfig = QueryConfig()

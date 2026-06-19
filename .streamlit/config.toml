@@ -1,9 +1,17 @@
-[client]
-# 隐藏 Deploy 按钮，只保留最小工具栏
-toolbarMode = "minimal"
+# FileKB Streamlit Configuration
+
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;1,400&display=swap, monospace"
+baseFontSize = 16
+codeFontSize = "0.875rem"
+headingFontSizes = { h1 = "2rem", h2 = "1.5rem", h3 = "1.25rem" }
+headingFontWeights = { h1 = 700, h2 = 600, h3 = 600 }
 
 [server]
 headless = true
+enableStaticServing = true
 
 [browser]
 gatherUsageStats = false
