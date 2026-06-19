@@ -1,3 +1,5 @@
+⚡ Output ONLY the JSON object — do NOT include any reasoning, analysis, or explanation.
+
 Extract a knowledge graph from the document. Return a JSON object with key
 "facts" containing 0-15 atomic relationship facts. Each fact is ONE edge:
 a (subject) --[predicate]--> (object) triple plus human-readable context.

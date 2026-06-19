@@ -45,7 +45,11 @@ for i, msg in enumerate(st.session_state.messages):
         if msg["role"] == "assistant" and "feedback_given" not in msg:
             fc1, fc2 = st.columns([1, 1])
             with fc1:
-                if st.button("👍 有帮助", key=f"up_{i}"):
+                if st.button(
+                    "👍 有帮助",
+                    key=f"up_{i}",
+                    help="标记此回答有帮助，系统会提升相关知识的权重",
+                ):
                     try:
                         requests.post(
                             f"{API_BASE}/feedback",
@@ -62,7 +66,11 @@ for i, msg in enumerate(st.session_state.messages):
                     except Exception:
                         st.error("反馈提交失败")
             with fc2:
-                if st.button("👎 没帮助", key=f"down_{i}"):
+                if st.button(
+                    "👎 没帮助",
+                    key=f"down_{i}",
+                    help="标记此回答无帮助，系统会降低相关知识的权重",
+                ):
                     try:
                         requests.post(
                             f"{API_BASE}/feedback",
@@ -121,7 +129,11 @@ if question:
                     # Feedback
                     fc1, fc2 = st.columns([1, 1])
                     with fc1:
-                        if st.button("👍 有帮助", key="up_new"):
+                        if st.button(
+                            "👍 有帮助",
+                            key="up_new",
+                            help="标记此回答有帮助，系统会提升相关知识的权重",
+                        ):
                             try:
                                 requests.post(
                                     f"{API_BASE}/feedback",
@@ -132,7 +144,11 @@ if question:
                             except Exception:
                                 st.error("反馈提交失败")
                     with fc2:
-                        if st.button("👎 没帮助", key="down_new"):
+                        if st.button(
+                            "👎 没帮助",
+                            key="down_new",
+                            help="标记此回答无帮助，系统会降低相关知识的权重",
+                        ):
                             try:
                                 requests.post(
                                     f"{API_BASE}/feedback",
@@ -160,9 +176,13 @@ if question:
 st.divider()
 c1, c2 = st.columns(2)
 with c1:
-    if st.button("🗑 清空对话", use_container_width=True):
+    if st.button(
+        "🗑 清空对话",
+        use_container_width=True,
+        help="清空当前对话历史。此操作不影响知识库中已索引的数据。",
+    ):
         st.session_state.messages = []
         st.rerun()
 with c2:
-    if st.button("🔄 刷新统计", use_container_width=True):
+    if st.button("🔄 刷新统计", use_container_width=True, help="刷新页面数据"):
         st.rerun()

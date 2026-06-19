@@ -72,19 +72,39 @@ def parse_file(file_path: str | Path) -> str:
     if suffix in TEXT_EXTENSIONS:
         return _parse_text(path)
     elif suffix == ".pdf":
-        text = _parse_pdf(path)
+        try:
+            text = _parse_pdf(path)
+        except ValueError as e:
+            logger.debug("PDF parse failed (will try OCR): %s — %s", path.name, e)
+            text = ""
         return _ocr_fallback(path, text) if _should_ocr(text) else text
     elif suffix in OFFICE_EXTENSIONS:
-        text = _parse_office(path)
+        try:
+            text = _parse_office(path)
+        except ValueError as e:
+            logger.debug("Office parse failed (will try OCR): %s — %s", path.name, e)
+            text = ""
         return _ocr_fallback(path, text) if _should_ocr(text) else text
     elif suffix in LEGACY_OFFICE_EXTENSIONS:
-        text = _parse_legacy_office(path)
+        try:
+            text = _parse_legacy_office(path)
+        except ValueError as e:
+            logger.debug("Legacy office parse failed (will try OCR): %s — %s", path.name, e)
+            text = ""
         return _ocr_fallback(path, text) if _should_ocr(text) else text
     elif suffix in LEGACY_XLS:
-        text = _parse_office(path)
+        try:
+            text = _parse_office(path)
+        except ValueError as e:
+            logger.debug("XLS parse failed (will try OCR): %s — %s", path.name, e)
+            text = ""
         return _ocr_fallback(path, text) if _should_ocr(text) else text
     elif suffix in IMAGE_EXTENSIONS:
-        return _parse_image(path)
+        try:
+            return _parse_image(path)
+        except ValueError as e:
+            logger.debug("Image parse failed (will try OCR fallback): %s — %s", path.name, e)
+            return _ocr_fallback(path, "")
     elif suffix in CODE_EXTENSIONS:
         return _parse_code(path)
     elif suffix == ".csv":
@@ -121,8 +141,27 @@ def _parse_text(path: Path) -> str:
 
 
 def _parse_pdf(path: Path) -> str:
-    """Parse PDF via markitdown → Docling → pymupdf chain."""
-    # Try markitdown first
+    """Parse PDF via pymupdf → markitdown → Docling chain.
+
+    pymupdf runs first because it's lightweight and has no GPU dependency.
+    Docling is last because its MPS inference can conflict with the LLM
+    server and crash the process.
+    """
+    # ── 1. pymupdf (fitz) — lightweight, text extraction only ──
+    try:
+        import fitz
+
+        doc = fitz.open(str(path))
+        pages = [page.get_text() for page in doc]
+        doc.close()
+        text = "\n\n".join(pages)
+        if text and len(text.strip()) > 50:
+            logger.debug("PDF parsed via pymupdf: %s", path.name)
+            return text
+    except Exception as e:
+        logger.debug("pymupdf PDF failed for %s: %s", path.name, e)
+
+    # ── 2. markitdown ──
     try:
         from markitdown import MarkItDown
 
@@ -135,34 +174,13 @@ def _parse_pdf(path: Path) -> str:
     except Exception as e:
         logger.debug("markitdown PDF failed for %s: %s", path.name, e)
 
-    # Try Docling for table-heavy PDFs
-    try:
-        from docling.document_converter import DocumentConverter
-
-        converter = DocumentConverter()
-        result = converter.convert(str(path))
-        text = result.document.export_to_markdown()
-        if text and len(text.strip()) > 50:
-            logger.debug("PDF parsed via Docling: %s", path.name)
-            return text
-    except Exception as e:
-        logger.debug("Docling PDF failed for %s: %s", path.name, e)
-
-    # Fall back to pymupdf (fitz)
-    try:
-        import fitz  # PyMuPDF
-
-        doc = fitz.open(str(path))
-        pages = [page.get_text() for page in doc]
-        doc.close()
-        text = "\n\n".join(pages)
-        if text.strip():
-            logger.debug("PDF parsed via pymupdf: %s", path.name)
-            return text
-    except Exception as e:
-        logger.debug("pymupdf PDF failed for %s: %s", path.name, e)
-
-    raise ValueError(f"All PDF parsers failed for: {path.name}")
+    # ── 3. Don't use Docling for PDFs ──
+    # Docling uses MPS (Apple Silicon GPU) for layout detection, which conflicts
+    # with the oMLX LLM server and can crash the entire process (SIGKILL).
+    # Instead, return empty — the caller's _ocr_fallback will use Apple Vision
+    # OCR (Neural Engine, no GPU conflict) to extract text from image-based PDFs.
+    logger.debug("pymupdf+markitdown failed for %s — deferring to OCR", path.name)
+    raise ValueError(f"Text extraction failed for: {path.name} (will use OCR)")
 
 
 # ------------------------------------------------------------------
@@ -178,7 +196,8 @@ def _parse_office(path: Path) -> str:
     result = md.convert(str(path))
     text = result.text_content
     if not text or len(text.strip()) < 10:
-        raise ValueError(f"markitdown produced empty or near-empty output for: {path.name}")
+        logger.debug("markitdown empty/near-empty for %s — will try OCR", path.name)
+        return ""  # Return empty so _ocr_fallback can try OCR
     return text
 
 

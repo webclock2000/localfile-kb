@@ -30,7 +30,7 @@ with tc1:
 with tc2:
     hop = st.selectbox("扩展跳数", [1, 2, 3], index=0)
 with tc3:
-    if st.button("🔍 搜索", use_container_width=True):
+    if st.button("🔍 搜索", use_container_width=True, help="在知识图谱中搜索该实体及其关联关系"):
         pass  # Trigger rerun with current inputs
 
 # ── Graph area ──

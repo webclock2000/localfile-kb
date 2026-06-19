@@ -252,6 +252,47 @@ class Store:
             "SELECT * FROM files WHERE status = ?", (status,)
         ).fetchall()
 
+    def list_files(
+        self,
+        status: str | None = None,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[sqlite3.Row], int]:
+        """List files with fact counts, optional status filter and path search.
+
+        Returns (rows, total_count).
+        """
+        where: list[str] = []
+        params: list[Any] = []
+
+        if status:
+            where.append("f.status = ?")
+            params.append(status)
+        if search:
+            where.append("f.path LIKE ?")
+            params.append(f"%{search}%")
+
+        where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+        count_sql = f"SELECT COUNT(*) FROM files f {where_clause}"
+        total = self.conn.execute(count_sql, params).fetchone()[0]
+
+        query_sql = f"""
+            SELECT f.id, f.path, f.status, f.error_msg, f.file_size,
+                   f.mtime, f.indexed_at, f.created_at,
+                   COUNT(DISTINCT c.id) AS chunk_count,
+                   COUNT(DISTINCT fa.id) AS fact_count
+            FROM files f
+            LEFT JOIN chunks c ON c.file_id = f.id
+            LEFT JOIN facts fa ON fa.file_id = f.id AND fa.status = 'active'
+            {where_clause}
+            GROUP BY f.id
+            ORDER BY f.indexed_at DESC, f.created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        rows = self.conn.execute(query_sql, params + [limit, offset]).fetchall()
+        return rows, total
+
     def update_file_status(
         self, file_id: int, status: str, error_msg: str | None = None
     ) -> None:
@@ -278,6 +319,49 @@ class Store:
 
     def get_file_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+    def clear_all_data(self) -> dict[str, int]:
+        """Delete all rows from every data table, preserving schema.
+
+        Tables are cleared in reverse-dependency order (children before
+        parents) so foreign-key constraints are satisfied.  The FTS5
+        index is rebuilt (empty) and sqlite_sequence counters are reset.
+
+        Returns a dict of ``{table_name: rows_deleted}``.
+        """
+        # Order matters — delete leaf tables first
+        tables = [
+            "failed_chunks",      # → chunks, files
+            "user_feedback",      # → facts
+            "entity_proposals",   # no FK
+            "facts",              # → files, chunks  (FTS triggers keep facts_fts in sync)
+            "chunks",             # → files
+            "files",              # → directories
+            "directories",        # root
+            "runs",               # no FK
+            "user_preferences",   # no FK
+        ]
+
+        counts: dict[str, int] = {}
+        with self.conn:
+            for table in tables:
+                cur = self.conn.execute(f"DELETE FROM {table}")
+                counts[table] = cur.rowcount
+
+            # Reset auto-increment counters so ids start from 1 again
+            for table in tables:
+                self.conn.execute(
+                    "DELETE FROM sqlite_sequence WHERE name = ?", (table,)
+                )
+
+            # Rebuild FTS5 index from the (now-empty) facts table
+            self.conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+
+        # VACUUM must run outside any transaction
+        self.conn.execute("VACUUM")
+
+        logger.info("Cleared all data (%d tables): %s", len(tables), counts)
+        return counts
 
     # ------------------------------------------------------------------
     # Chunk CRUD
@@ -459,11 +543,12 @@ class Store:
         confidence: float,
         proposed_name: str | None = None,
         llm_response: str | None = None,
+        status: str = "proposed",
     ) -> int:
         self.conn.execute(
-            """INSERT INTO entity_proposals (entity_a, entity_b, proposed_name, confidence, llm_response)
-               VALUES (?, ?, ?, ?, ?)""",
-            (entity_a, entity_b, proposed_name, confidence, llm_response),
+            """INSERT INTO entity_proposals (entity_a, entity_b, proposed_name, confidence, llm_response, status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (entity_a, entity_b, proposed_name, confidence, llm_response, status),
         )
         self.conn.commit()
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -535,6 +620,33 @@ class Store:
             "SELECT error_class, COUNT(*) as cnt FROM failed_chunks "
             "WHERE status = 'pending' GROUP BY error_class"
         ).fetchall()
+
+    def get_all_dlq(
+        self, status: str | None = None, limit: int = 100
+    ) -> list[sqlite3.Row]:
+        """Return DLQ entries with file path for UI display."""
+        query = (
+            "SELECT fc.*, f.path AS file_path "
+            "FROM failed_chunks fc "
+            "LEFT JOIN files f ON fc.file_id = f.id "
+        )
+        params: tuple = ()
+        if status:
+            query += " WHERE fc.status = ?"
+            params = (status,)
+        query += " ORDER BY fc.created_at DESC LIMIT ?"
+        params = params + (limit,)
+        return self.conn.execute(query, params).fetchall()
+
+    def retry_single_dlq(self, entry_id: int) -> bool:
+        """Mark a single DLQ entry for retry by resetting status to pending."""
+        cur = self.conn.execute(
+            "UPDATE failed_chunks SET status = 'pending', "
+            "next_retry_at = datetime('now') WHERE id = ? AND status != 'done'",
+            (entry_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Lifecycle

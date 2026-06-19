@@ -294,50 +294,69 @@ def apply_merges(
 ) -> int:
     """Execute confirmed entity merges.
 
-    Adapted from sift-kg's 'sift apply-merges' stage.
-    Rewires all edges in the graph and updates fact references in SQLite.
+    - auto_approved (similarity >= 0.85): merge immediately in graph + SQLite,
+      store as status='approved'.
+    - proposed (LLM confirms, lower confidence): store as status='proposed' in
+      entity_proposals table for human review — do NOT auto-merge.
+    - rejected: skip entirely.
 
     Args:
         store: Store instance.
         graph_store: GraphStore instance.
-        proposals: Validated proposals with status 'auto_approved' or 'proposed'.
+        proposals: Validated proposals with status 'auto_approved', 'proposed', or 'rejected'.
 
     Returns:
-        Number of merges applied.
+        Number of auto-merges applied.
     """
     merged = 0
     for prop in proposals:
-        if prop["status"] not in ("auto_approved", "proposed"):
+        status = prop.get("status", "rejected")
+
+        if status == "rejected":
             continue
 
-        # Store proposal in DB
-        store.insert_proposal(
-            entity_a=prop["entity_a"],
-            entity_b=prop["entity_b"],
-            confidence=prop["similarity"],
-            proposed_name=prop.get("canonical_name"),
-            llm_response=json.dumps(prop.get("llm_judgment", {})),
-        )
+        if status == "auto_approved":
+            # Store as approved + execute merge immediately
+            store.insert_proposal(
+                entity_a=prop["entity_a"],
+                entity_b=prop["entity_b"],
+                confidence=prop["similarity"],
+                proposed_name=prop.get("canonical_name"),
+                llm_response=json.dumps(prop.get("llm_judgment", {})),
+                status="approved",
+            )
+            from_entity = prop["entity_a"]
+            to_entity = prop.get("canonical_name", prop["entity_b"])
+            if from_entity and to_entity and from_entity != to_entity:
+                edges_rewired = graph_store.merge_entities(from_entity, to_entity)
+                store.conn.execute(
+                    "UPDATE facts SET subject = ? WHERE subject = ?",
+                    (to_entity, from_entity),
+                )
+                store.conn.execute(
+                    "UPDATE facts SET object = ? WHERE object = ?",
+                    (to_entity, from_entity),
+                )
+                store.conn.commit()
+                merged += 1
+                logger.info(
+                    "Auto-merged '%s' → '%s': %d edges rewired",
+                    from_entity, to_entity, edges_rewired,
+                )
 
-        # Execute merge in graph
-        from_entity = prop["entity_a"]
-        to_entity = prop.get("canonical_name", prop["entity_b"])
-        if from_entity and to_entity and from_entity != to_entity:
-            edges_rewired = graph_store.merge_entities(from_entity, to_entity)
-            # Update fact references in SQLite
-            store.conn.execute(
-                "UPDATE facts SET subject = ? WHERE subject = ?",
-                (to_entity, from_entity),
+        elif status == "proposed":
+            # Store for human review only — do NOT merge
+            store.insert_proposal(
+                entity_a=prop["entity_a"],
+                entity_b=prop["entity_b"],
+                confidence=prop["similarity"],
+                proposed_name=prop.get("canonical_name"),
+                llm_response=json.dumps(prop.get("llm_judgment", {})),
+                status="proposed",
             )
-            store.conn.execute(
-                "UPDATE facts SET object = ? WHERE object = ?",
-                (to_entity, from_entity),
-            )
-            store.conn.commit()
-            merged += 1
             logger.info(
-                "Merged '%s' → '%s': %d edges rewired",
-                from_entity, to_entity, edges_rewired,
+                "Proposal queued for review: '%s' ↔ '%s' (%.2f)",
+                prop["entity_a"], prop["entity_b"], prop["similarity"],
             )
 
     return merged

@@ -1,6 +1,7 @@
 # FileKB Streamlit Configuration
 
 [theme]
+# base 不设置 = 跟随系统，用户可通过右上方按钮临时切换
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
 headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
 codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;1,400&display=swap, monospace"

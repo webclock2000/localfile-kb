@@ -79,6 +79,12 @@ st.html("""
     /* ── Section dividers ── */
     hr { margin: 0.75rem 0; }
 
+    /* ── Tab headers: larger ── */
+    button[data-baseweb="tab"] p {
+        font-size: 1.5rem !important;
+        font-weight: 600 !important;
+    }
+
     /* ── Sidebar nav items: match heading size ── */
     [data-testid="stSidebarNav"] a {
         font-size: 1.1rem;
@@ -127,18 +133,29 @@ def _load_kb_stats(kb_name: str):
         pass
     st.session_state.kb_stats = {}
 
-# Load KB list on first run / when stale
-if st.session_state.kb_names == ["默认"] and not st.session_state.kb_meta:
+# ── Sidebar data refresh ──
+# Pages signal changes via ``_sidebar_stale = True`` so the sidebar
+# re-fetches KB list + stats instead of relying on cached session state.
+# When stale, also reset the selectbox widget so it picks up global_kb
+# via the ``index`` parameter (Streamlit selectbox ignores index if its
+# session_state key already exists).
+_sb_stale: bool = st.session_state.pop("_sidebar_stale", False)
+
+if _sb_stale:
+    st.session_state.pop("sidebar_kb_widget", None)
+    st.session_state.pop("pending_kb", None)
+    _load_kb_list()
+elif st.session_state.kb_names == ["默认"] and not st.session_state.kb_meta:
     _load_kb_list()
 
-# Ensure current KB exists in list
+# Ensure current KB exists in list (may have been deleted by another page)
 current_kb: str = st.session_state.global_kb
 if current_kb not in st.session_state.kb_names:
     st.session_state.global_kb = st.session_state.kb_names[0]
     current_kb = st.session_state.kb_names[0]
 
-# Load stats for current KB (once per session, or after switch)
-if not st.session_state.kb_stats or st.session_state.kb_stats.get("kb") != current_kb:
+# Reload stats on first load, KB switch, or when data is stale
+if _sb_stale or not st.session_state.kb_stats or st.session_state.kb_stats.get("kb") != current_kb:
     _load_kb_stats(current_kb)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -223,26 +240,30 @@ with st.sidebar:
         st.error("⚠️ 后端 API 不可用")
 
 # ═══════════════════════════════════════════════════════════════════
-# Theme toggle — top-right of main content, uses native Streamlit theme
+# Theme toggle — top-right of main content, 3-way cycle
 # ═══════════════════════════════════════════════════════════════════
-
-# 使用 st._config.set_option("theme.base", ...) 调用 Streamlit 原生主题系统，
-# 完全避免 CSS 注入导致的白条和不完整覆盖问题。
+# None (跟随系统) → "light" → "dark" → None ...
 
 current_theme = st._config.get_option("theme.base")  # None=跟随系统, "light", "dark"
 
-# Put toggle at the top-right of the main content area
+# Map: current → (icon, next_value, help_text)
+THEME_CYCLE: dict[str | None, tuple[str, str | None, str]] = {
+    None:    ("🖥️", "light", "当前：跟随系统。点击切换为浅色模式。"),
+    "light": ("☀️", "dark",  "当前：浅色模式。点击切换为深色模式。"),
+    "dark":  ("🌙", None,    "当前：深色模式。点击切换为跟随系统。"),
+}
+
+icon, next_theme, help_text = THEME_CYCLE.get(current_theme, THEME_CYCLE[None])
+
 _, _, theme_btn_col = st.columns([8, 1, 1])
 with theme_btn_col:
-    if current_theme == "dark":
-        if st.button("☀️", key="theme_switch", help="切换到浅色模式"):
-            st._config.set_option("theme.base", "light")
-            st.rerun()
-    else:
-        # None (跟随系统) or "light" → show moon icon
-        if st.button("🌙", key="theme_switch", help="切换到深色模式"):
-            st._config.set_option("theme.base", "dark")
-            st.rerun()
+    if st.button(icon, key="theme_switch", help=help_text):
+        if next_theme is None:
+            # 回到跟随系统 — 删除显式设置，让 config.toml 的 base=null 生效
+            st._config.set_option("theme.base", None)
+        else:
+            st._config.set_option("theme.base", next_theme)
+        st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════
 # Navigation

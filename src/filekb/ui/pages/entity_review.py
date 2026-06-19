@@ -51,7 +51,13 @@ try:
                         with pc2:
                             bc1, bc2 = st.columns(2)
                             with bc1:
-                                if st.button("✓ 批准", key=f"app_{prop['id']}", use_container_width=True):
+                                if st.button(
+                                    "✓ 批准",
+                                    key=f"app_{prop['id']}",
+                                    use_container_width=True,
+                                    help="确认这两个实体是同一事物，执行合并。"
+                                    "相关的关系会自动重连到合并后的实体。",
+                                ):
                                     try:
                                         requests.post(
                                             f"{API_BASE}/entities/merge",
@@ -67,7 +73,12 @@ try:
                                     except Exception as e:
                                         st.error(str(e))
                             with bc2:
-                                if st.button("✗ 拒绝", key=f"rej_{prop['id']}", use_container_width=True):
+                                if st.button(
+                                    "✗ 拒绝",
+                                    key=f"rej_{prop['id']}",
+                                    use_container_width=True,
+                                    help="认为这两个实体不是同一事物，拒绝本次合并提案",
+                                ):
                                     try:
                                         requests.post(
                                             f"{API_BASE}/entities/reject",

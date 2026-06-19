@@ -60,7 +60,7 @@ with tab_llm:
             key="llm_ctx",
         )
 
-    if st.button("💾 保存 LLM 设置", key="save_llm"):
+    if st.button("💾 保存 LLM 设置", key="save_llm", help="保存大语言模型配置，重启服务后生效"):
         try:
             requests.post(f"{API_BASE}/settings", json={
                 "section": "llm",
@@ -102,7 +102,7 @@ with tab_emb:
             key="emb_omxl",
         )
 
-    if st.button("💾 保存 Embedding 设置", key="save_emb"):
+    if st.button("💾 保存 Embedding 设置", key="save_emb", help="保存嵌入模型配置，重启服务后生效"):
         try:
             requests.post(f"{API_BASE}/settings", json={
                 "section": "embedding",
@@ -133,7 +133,7 @@ with tab_ocr:
         key="ocr_conf",
     )
 
-    if st.button("💾 保存 OCR 设置", key="save_ocr"):
+    if st.button("💾 保存 OCR 设置", key="save_ocr", help="保存 OCR 文字识别配置"):
         try:
             requests.post(f"{API_BASE}/settings", json={
                 "section": "ocr",

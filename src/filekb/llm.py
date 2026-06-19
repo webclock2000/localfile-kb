@@ -111,6 +111,7 @@ class LLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.3,
         stream: bool = False,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Send a chat completion request with automatic retry.
 
@@ -119,11 +120,13 @@ class LLMClient:
             max_tokens: Maximum tokens in the response.
             temperature: Sampling temperature.
             stream: Whether to stream the response.
+            extra_body: Additional JSON fields to merge into the request body
+                        (e.g. {"enable_thinking": False} for oMLX).
 
         Returns:
             LLMResponse with content and metadata.
         """
-        return self._chat_with_retry(messages, max_tokens, temperature, stream)
+        return self._chat_with_retry(messages, max_tokens, temperature, stream, extra_body)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -138,15 +141,18 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
         stream: bool,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Internal method with tenacity retry decorator."""
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": stream,
         }
+        if extra_body:
+            payload.update(extra_body)
 
         response = self._client.post("/chat/completions", json=payload)
         response.raise_for_status()
@@ -222,6 +228,7 @@ class LLMClient:
         system_prompt: str,
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Extract facts from a text chunk.
 
@@ -230,6 +237,7 @@ class LLMClient:
             system_prompt: The extraction prompt (system message).
             max_tokens: Max output tokens.
             temperature: Sampling temperature.
+            extra_body: Additional JSON fields for the request body.
 
         Returns:
             LLMResponse — check is_truncated to detect overflow.
@@ -238,7 +246,7 @@ class LLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": chunk_text},
         ]
-        return self.chat(messages, max_tokens=max_tokens, temperature=temperature)
+        return self.chat(messages, max_tokens=max_tokens, temperature=temperature, extra_body=extra_body)
 
     def generate_answer(
         self,
@@ -268,6 +276,7 @@ class LLMClient:
         partial_json: str,
         system_prompt: str,
         max_tokens: int = 2048,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Continue generation after a truncated JSON response.
 
@@ -277,15 +286,15 @@ class LLMClient:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": (
-                "Your previous response was cut off. Here is the exact text "
-                "you were in the middle of:\n---\n"
-                f"{partial_json}\n"
-                "---\n"
-                "Continue from where you stopped, emitting only valid JSON "
-                "objects matching the FACT_SCHEMA."
+                "Your previous response was cut off before you could output "
+                "the JSON facts. Output ONLY the JSON object now — no reasoning, "
+                "no explanation, just pure JSON with the facts you identified.\n\n"
+                'Required format: {"facts": [{"title": "...", "subject": "...", '
+                '"predicate": "...", "object": "...", "evidence_span": "...", '
+                '"confidence": <0-100>, "description": "...", "tags": [...]}, ...]}'
             )},
         ]
-        return self.chat(messages, max_tokens=max_tokens, temperature=0.3)
+        return self.chat(messages, max_tokens=max_tokens, temperature=0.3, extra_body=extra_body)
 
     # ------------------------------------------------------------------
     # Health check

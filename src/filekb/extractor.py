@@ -159,7 +159,8 @@ def _extract_one_round(
     chunk_text: str,
     system_prompt: str,
     round_num: int,
-    max_tokens: int = 4096,
+    max_tokens: int = 16384,
+    extra_body: dict[str, Any] | None = None,
 ) -> tuple[list[Fact], bool]:
     """Run one extraction round with a seeded temperature variation.
 
@@ -173,17 +174,45 @@ def _extract_one_round(
         system_prompt=system_prompt,
         max_tokens=max_tokens,
         temperature=temp,
+        extra_body=extra_body,
     )
 
     facts_dicts = _incremental_json_parse(response.content)
     facts = [Fact.from_dict(d) for d in facts_dicts]
 
     if response.is_truncated and not facts:
-        # Try continuation
+        # Try continuation with a force-JSON prompt
         partial = response.content
-        continuation = client.continue_truncated(partial, system_prompt)
+        continuation = client.continue_truncated(
+            partial, system_prompt, extra_body={"enable_thinking": False},
+        )
         more_dicts = _incremental_json_parse(continuation.content)
         facts.extend(Fact.from_dict(d) for d in more_dicts)
+
+        # If STILL no facts, try once more with explicit instruction
+        if not facts:
+            logger.debug("Continuation also yielded no facts — trying force-JSON prompt")
+            try:
+                force_resp = client.chat(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": (
+                            "You already analysed the document above. "
+                            "Now output ONLY the JSON object with the facts you found. "
+                            'Format: {"facts": [{"title": "...", "subject": "...", '
+                            '"predicate": "...", "object": "...", "evidence_span": "...", '
+                            '"confidence": 85, "description": "...", "tags": [...]}, ...]}'
+                            "\nDo NOT include any reasoning or explanation — pure JSON only."
+                        )},
+                    ],
+                    max_tokens=8192,
+                    temperature=0.1,
+                    extra_body={"enable_thinking": False},
+                )
+                force_dicts = _incremental_json_parse(force_resp.content)
+                facts.extend(Fact.from_dict(d) for d in force_dicts)
+            except Exception as e:
+                logger.warning("Force-JSON retry failed: %s", e)
 
     return facts, response.is_truncated
 
@@ -194,10 +223,15 @@ def extract_facts(
     chunk_id: int = 0,
     rounds: int = 2,
     confidence_threshold: int = 30,
+    extra_body: dict[str, Any] | None = None,
 ) -> ExtractionResult:
     """Extract facts from a text chunk using multi-round LLM extraction.
 
     Automatically routes Chinese text to extract_zh.txt prompt.
+
+    Args:
+        extra_body: Additional JSON fields for the LLM request body
+                    (e.g. {"enable_thinking": False} for oMLX).
     """
     result = ExtractionResult(chunk_id=chunk_id)
 
@@ -219,7 +253,8 @@ def extract_facts(
     for r in range(rounds):
         try:
             facts, truncated = _extract_one_round(
-                client, chunk_text, system_prompt, r
+                client, chunk_text, system_prompt, r,
+                extra_body=extra_body,
             )
             if truncated:
                 truncated_any = True
