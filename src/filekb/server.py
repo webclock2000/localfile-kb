@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
     if not app.state.vector_store.load(faiss_dir):
         app.state.vector_store.rebuild_from_sqlite(app.state.store)
     app.state.graph_store = GraphStore()
+    _rebuild_graph(app)
     logger.info("FileKB server started on http://localhost:9494")
 
     yield
@@ -81,6 +82,17 @@ app = FastAPI(
     description="File-driven personal knowledge base API",
     lifespan=lifespan,
 )
+
+
+def _rebuild_graph(app_ref: FastAPI) -> None:
+    """Rebuild knowledge graph from SQLite facts."""
+    store = app_ref.state.store
+    gs = app_ref.state.graph_store
+    rows = store.conn.execute(
+        "SELECT id, subject, predicate, object, confidence FROM facts WHERE status='active'"
+    ).fetchall()
+    gs.rebuild_from_facts([dict(r) for r in rows])
+    logger.info("Graph rebuilt: %d nodes, %d edges", gs.node_count, gs.edge_count)
 
 
 # ============================================================================
@@ -175,14 +187,20 @@ def ask_endpoint(req: AskRequest, request: Request):
 
 @app.post("/ask/stream")
 async def ask_stream_endpoint(req: AskRequest, request: Request):
-    """Stream answer tokens via Server-Sent Events."""
+    """Stream answer tokens via Server-Sent Events (real LLM streaming).
+
+    Retrieves context, then streams LLM tokens one by one via SSE.
+    Final event carries sources and related facts.
+    """
     from filekb.query import query as run_query
 
     store = request.app.state.store
     llm_client = request.app.state.llm_client
     vs = request.app.state.vector_store
     gs = request.app.state.graph_store
+    cfg = request.app.state.config
 
+    # Retrieve context (non-streaming part)
     result = run_query(
         question=req.question,
         store=store,
@@ -190,20 +208,47 @@ async def ask_stream_endpoint(req: AskRequest, request: Request):
         graph_store=gs,
         llm_client=llm_client,
         vector_top_k=req.top_k,
+        answer_max_tokens=cfg.query.answer_max_tokens,
     )
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        # Simulate streaming by tokenizing the answer
-        tokens = result.answer.split()
-        for token in tokens:
-            yield f"event: token\ndata: {json.dumps({'token': token + ' '})}\n\n"
+    # Build the system prompt with context
+    from filekb.extractor import _load_prompt
 
-        # Send final metadata
-        final = {
-            "sources": result.sources,
-            "related_facts": result.related_facts,
-        }
-        yield f"event: done\ndata: {json.dumps(final)}\n\n"
+    try:
+        sys_prompt = _load_prompt("answer.txt")
+        # Extract context parts from result
+        ctx_parts = []
+        for sf in result.related_facts:
+            title = sf.get("title", "") or "{} {} {}".format(
+                sf.get("subject", "?"), sf.get("predicate", "?"), sf.get("object", "?")
+            )
+            ctx_parts.append("[来源: {}] {}".format(sf.get("source", "?"), title))
+        context_text = "\n".join(ctx_parts) if ctx_parts else "无相关上下文"
+        sys_prompt = sys_prompt.replace("{context}", context_text)
+    except FileNotFoundError:
+        sys_prompt = "基于提供的上下文回答问题，为每个声明引用源文件。"
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": req.question},
+    ]
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        try:
+            for token_text, finish in llm_client.chat_stream(
+                messages, max_tokens=cfg.query.answer_max_tokens,
+            ):
+                if token_text:
+                    yield f"event: token\ndata: {json.dumps({'token': token_text})}\n\n"
+            # Send final metadata
+            final_data = {
+                "sources": result.sources,
+                "related_facts": result.related_facts,
+            }
+            yield f"event: done\ndata: {json.dumps(final_data)}\n\n"
+        except Exception as e:
+            logger.error("Stream error: %s", e)
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -215,9 +260,9 @@ async def ask_stream_endpoint(req: AskRequest, request: Request):
 
 @app.get("/graph")
 def graph_endpoint(
+    request: Request,
     entity: str = Query(..., description="Seed entity name"),
     hop: int = Query(default=1, ge=1, le=3),
-    request: Request = None,
 ):
     """Get graph nodes and edges around an entity."""
     gs = request.app.state.graph_store
@@ -303,9 +348,9 @@ def status_endpoint(request: Request):
 
 @app.get("/facts")
 def facts_endpoint(
+    request: Request,
     entity: str = Query(..., description="Entity name to search for"),
     limit: int = Query(default=50, ge=1, le=200),
-    request: Request = None,
 ):
     """Retrieve facts for a given entity."""
     store = request.app.state.store
@@ -357,8 +402,8 @@ def feedback_endpoint(req: FeedbackRequest, request: Request):
 
 @app.get("/entities/proposals")
 def entity_proposals_endpoint(
+    request: Request,
     status: str = Query(default="proposed"),
-    request: Request = None,
 ):
     """Get entity merge proposals."""
     store = request.app.state.store
@@ -416,9 +461,9 @@ def entity_merge_endpoint(req: EntityMergeRequest, request: Request):
 
 @app.get("/logs")
 def logs_endpoint(
+    request: Request,
     lines: int = Query(default=50, ge=1, le=500),
     level: str = Query(default="DEBUG"),
-    request: Request = None,
 ):
     """Get recent log entries from the log file."""
     cfg = request.app.state.config

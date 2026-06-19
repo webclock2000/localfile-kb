@@ -164,6 +164,54 @@ class LLMClient:
             raw_response=data,
         )
 
+    def chat_stream(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+    ):
+        """Stream chat tokens via Server-Sent Events from oMLX.
+
+        Yields (token_text, finish_reason_or_None) tuples.
+        The last tuple has finish_reason set.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        with self._client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            finish_reason = None
+
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]  # Strip "data: " prefix
+                if data_str == "[DONE]":
+                    yield ("", "stop")
+                    return
+
+                try:
+                    data = json.loads(data_str)
+                    choices = data.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content", "")
+                        finish_reason = choices[0].get("finish_reason")
+                        if content:
+                            yield (content, finish_reason)
+                        if finish_reason:
+                            return
+                except json.JSONDecodeError:
+                    continue
+
+            yield ("", finish_reason or "stop")
+
     # ------------------------------------------------------------------
     # Extraction-specific
     # ------------------------------------------------------------------
