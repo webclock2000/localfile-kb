@@ -41,7 +41,7 @@ if entity_query:
                 # Build yfiles graph
                 widget = GraphWidget()
                 widget.directed = True
-                widget.set_graph_layout(layout_choice)
+                widget.graph_layout = layout_choice
 
                 yf_nodes = []
                 for n in nodes:
