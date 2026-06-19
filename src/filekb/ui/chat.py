@@ -36,7 +36,7 @@ if question:
         with st.spinner("正在搜索知识库..."):
             try:
                 resp = requests.post(
-                    f"{API_BASE}/ask", json={"question": question}, timeout=120,
+                    f"{API_BASE}/ask", json={"question": question, "kb": selected_kb}, timeout=120,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -95,8 +95,27 @@ if question:
 
 with st.sidebar:
     st.header("📊 知识库概览")
+
+    # KB selector
+    if "selected_kb" not in st.session_state:
+        st.session_state.selected_kb = "默认"
+
     try:
-        resp = requests.get(f"{API_BASE}/status", timeout=5)
+        settings_resp = requests.get(f"{API_BASE}/settings", timeout=5)
+        if settings_resp.status_code == 200:
+            kb_names = settings_resp.json().get("kb_names", ["默认"])
+            st.session_state.selected_kb = st.selectbox(
+                "知识库", kb_names,
+                index=kb_names.index(st.session_state.selected_kb)
+                if st.session_state.selected_kb in kb_names else 0,
+            )
+    except Exception:
+        pass
+
+    selected_kb = st.session_state.selected_kb
+
+    try:
+        resp = requests.get(f"{API_BASE}/status?kb={selected_kb}", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             st.metric("文件数", data.get("files_total", 0))
