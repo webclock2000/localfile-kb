@@ -73,32 +73,32 @@ def parse_file(file_path: str | Path) -> str:
         return _parse_text(path)
     elif suffix == ".pdf":
         try:
-            text = _parse_pdf(path)
+            return _parse_pdf(path)  # Per-page extraction + OCR inside
         except ValueError as e:
-            logger.debug("PDF parse failed (will try OCR): %s — %s", path.name, e)
-            text = ""
-        return _ocr_fallback(path, text) if _should_ocr(text) else text
+            logger.debug("PDF text extraction failed: %s — %s", path.name, e)
+        # All methods failed — try full-page OCR as last resort
+        return _ocr_fallback(path, "")
     elif suffix in OFFICE_EXTENSIONS:
         try:
             text = _parse_office(path)
         except ValueError as e:
             logger.debug("Office parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
-        return _ocr_fallback(path, text) if _should_ocr(text) else text
+        return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in LEGACY_OFFICE_EXTENSIONS:
         try:
             text = _parse_legacy_office(path)
         except ValueError as e:
             logger.debug("Legacy office parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
-        return _ocr_fallback(path, text) if _should_ocr(text) else text
+        return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in LEGACY_XLS:
         try:
             text = _parse_office(path)
         except ValueError as e:
             logger.debug("XLS parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
-        return _ocr_fallback(path, text) if _should_ocr(text) else text
+        return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in IMAGE_EXTENSIONS:
         try:
             return _parse_image(path)
@@ -141,27 +141,60 @@ def _parse_text(path: Path) -> str:
 
 
 def _parse_pdf(path: Path) -> str:
-    """Parse PDF via pymupdf → markitdown → Docling chain.
+    """Parse PDF via pymupdf per-page extraction + OCR supplementation.
 
-    pymupdf runs first because it's lightweight and has no GPU dependency.
-    Docling is last because its MPS inference can conflict with the LLM
-    server and crash the process.
+    For each page, extracts text via pymupdf. Pages with very sparse text
+    (< 100 chars) are OCR'd via Apple Vision (when enabled). This handles
+    mixed PDFs with both text and scanned-image pages.
+
+    Falls back to markitdown if pymupdf fails entirely.
     """
-    # ── 1. pymupdf (fitz) — lightweight, text extraction only ──
+    from filekb.config import Config
+
+    cfg = Config()
+
+    # ── 1. pymupdf per-page extraction + OCR supplementation ──
     try:
         import fitz
 
         doc = fitz.open(str(path))
-        pages = [page.get_text() for page in doc]
+        page_count = doc.page_count
+        page_texts: list[str] = []
+
+        for i, page in enumerate(doc):
+            page_text = page.get_text()
+            cleaned = "".join(c for c in page_text if c.isalnum() or c.isspace()).strip()
+
+            if len(cleaned) < 100 and cfg.ocr.enabled:
+                # Sparse page — try OCR
+                try:
+                    from filekb.ocr import recognize_pdf_page
+                    ocr_text = recognize_pdf_page(
+                        str(path), page_index=i,
+                        dpi=cfg.ocr.pdf_dpi,
+                        languages=tuple(cfg.ocr.languages),
+                        min_confidence=cfg.ocr.min_confidence,
+                    )
+                    if ocr_text and len(ocr_text.strip()) > len(page_text.strip()):
+                        logger.debug("PDF page %d OCR improved: %d → %d chars",
+                                   i, len(page_text), len(ocr_text))
+                        page_text = ocr_text
+                except Exception as e:
+                    logger.debug("PDF page %d OCR skipped: %s", i, e)
+
+            if page_text.strip():
+                page_texts.append(page_text)
+
         doc.close()
-        text = "\n\n".join(pages)
+        text = "\n\n".join(page_texts)
         if text and len(text.strip()) > 50:
-            logger.debug("PDF parsed via pymupdf: %s", path.name)
+            logger.debug("PDF parsed via pymupdf+OCR: %s (%d pages → %d chars)",
+                       path.name, page_count, len(text))
             return text
     except Exception as e:
         logger.debug("pymupdf PDF failed for %s: %s", path.name, e)
 
-    # ── 2. markitdown ──
+    # ── 2. markitdown fallback ──
     try:
         from markitdown import MarkItDown
 
@@ -174,12 +207,8 @@ def _parse_pdf(path: Path) -> str:
     except Exception as e:
         logger.debug("markitdown PDF failed for %s: %s", path.name, e)
 
-    # ── 3. Don't use Docling for PDFs ──
-    # Docling uses MPS (Apple Silicon GPU) for layout detection, which conflicts
-    # with the oMLX LLM server and can crash the entire process (SIGKILL).
-    # Instead, return empty — the caller's _ocr_fallback will use Apple Vision
-    # OCR (Neural Engine, no GPU conflict) to extract text from image-based PDFs.
-    logger.debug("pymupdf+markitdown failed for %s — deferring to OCR", path.name)
+    # ── 3. All text extraction failed, defer to full-page OCR ──
+    logger.debug("pymupdf+markitdown failed for %s — deferring to full OCR", path.name)
     raise ValueError(f"Text extraction failed for: {path.name} (will use OCR)")
 
 
@@ -227,10 +256,13 @@ def _find_libreoffice() -> str | None:
 
 
 def _parse_legacy_office(path: Path) -> str:
-    """Convert legacy .doc/.ppt to text via LibreOffice headless.
+    """Convert legacy .doc/.ppt to text via LibreOffice → PDF → pymupdf.
 
-    Creates a temp dir, converts the file to .txt using LibreOffice,
-    reads the result, and cleans up.
+    Strategy: LibreOffice's PPT→TXT filter often produces empty or garbled
+    output.  Instead, convert to PDF and extract text with pymupdf, which
+    reliably pulls text from all shapes and text boxes on each slide.
+
+    Falls back to OCR of the PDF pages when pymupdf extraction is sparse.
     """
     lo_bin = _find_libreoffice()
     if lo_bin is None:
@@ -240,15 +272,14 @@ def _parse_legacy_office(path: Path) -> str:
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Copy file to temp dir (LibreOffice needs write access to the directory)
         import shutil
         tmp_path = Path(tmpdir) / path.name
         shutil.copy2(path, tmp_path)
 
-        # Convert to text via LibreOffice headless
+        # ── Step 1: Convert to PDF ──
         result = subprocess.run(
             [
-                lo_bin, "--headless", "--convert-to", "txt:Text",
+                lo_bin, "--headless", "--convert-to", "pdf",
                 "--outdir", tmpdir, str(tmp_path),
             ],
             capture_output=True, text=True, timeout=120,
@@ -256,24 +287,39 @@ def _parse_legacy_office(path: Path) -> str:
 
         if result.returncode != 0:
             raise ValueError(
-                f"LibreOffice conversion failed for {path.name}: {result.stderr[:200]}"
+                f"LibreOffice PDF conversion failed for {path.name}: {result.stderr[:200]}"
             )
 
-        # Find the output .txt file
-        txt_name = path.stem + ".txt"
-        txt_path = Path(tmpdir) / txt_name
-
-        if not txt_path.exists():
-            logger.debug("LibreOffice produced no .txt for %s — will try OCR", path.name)
+        pdf_path = Path(tmpdir) / (path.stem + ".pdf")
+        if not pdf_path.exists():
+            logger.debug("LibreOffice produced no PDF for %s — will try OCR", path.name)
             return ""  # Return empty so _ocr_fallback can try OCR
 
-        text = txt_path.read_text(encoding="utf-8", errors="replace")
-        if not text.strip():
-            logger.debug("LibreOffice produced empty text for %s — will try OCR", path.name)
-            return ""  # Return empty so _ocr_fallback can try OCR
+        # ── Step 2: Extract text from PDF via pymupdf ──
+        try:
+            import fitz
 
-        logger.debug("Legacy Office converted via LibreOffice: %s → %d chars", path.name, len(text))
-        return text
+            doc = fitz.open(str(pdf_path))
+            page_texts: list[str] = []
+            for i, page in enumerate(doc):
+                page_text = page.get_text()
+                if page_text.strip():
+                    page_texts.append(page_text)
+            doc.close()
+
+            text = "\n\n".join(page_texts)
+            if text and len(text.strip()) > 50:
+                logger.debug(
+                    "Legacy Office converted via LO→PDF→pymupdf: %s (%d pages → %d chars)",
+                    path.name, len(page_texts), len(text),
+                )
+                return text
+        except Exception as e:
+            logger.debug("pymupdf text extraction from LO PDF failed: %s", e)
+
+        # ── Step 3: pymupdf failed — return empty so OCR fallback can try ──
+        logger.debug("LO→PDF→pymupdf produced no useful text for %s — will try OCR", path.name)
+        return ""
 
 
 # ------------------------------------------------------------------
@@ -281,13 +327,28 @@ def _parse_legacy_office(path: Path) -> str:
 # ------------------------------------------------------------------
 
 
-def _should_ocr(text: str) -> bool:
+def _should_ocr(text: str, file_path: Path | None = None) -> bool:
     """Check if parsed text is too sparse to be useful — needs OCR.
 
-    Returns True if text is empty or very short (< 50 non-whitespace chars).
+    Returns True if:
+    - Text is empty or very short (< 200 non-whitespace chars), OR
+    - File is a PDF/image > 1 MB with suspiciously sparse text
+      (< 10 chars per KB, indicating image-heavy pages).
     """
     cleaned = "".join(c for c in text if c.isalnum() or c.isspace())
-    return len(cleaned.strip()) < 50
+    clean_len = len(cleaned.strip())
+
+    if clean_len < 200:
+        return True
+
+    # Density check for PDF/image files: if a large file yields very little
+    # text, the content is likely in scanned images that need OCR.
+    if file_path and file_path.suffix.lower() in ({".pdf"} | IMAGE_EXTENSIONS):
+        file_kb = file_path.stat().st_size / 1024
+        if file_kb > 1024 and clean_len / file_kb < 10:
+            return True
+
+    return False
 
 
 def _ocr_fallback(file_path: Path, original_text: str) -> str:

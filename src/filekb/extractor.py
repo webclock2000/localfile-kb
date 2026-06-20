@@ -181,24 +181,27 @@ def _extract_one_round(
     facts = [Fact.from_dict(d) for d in facts_dicts]
 
     if response.is_truncated and not facts:
-        # Try continuation with a force-JSON prompt
+        # Try continuation — resend original document + partial response
         partial = response.content
         continuation = client.continue_truncated(
-            partial, system_prompt, extra_body={"enable_thinking": False},
+            partial, system_prompt,
+            chunk_text=chunk_text,
+            extra_body={"enable_thinking": False},
         )
         more_dicts = _incremental_json_parse(continuation.content)
         facts.extend(Fact.from_dict(d) for d in more_dicts)
 
-        # If STILL no facts, try once more with explicit instruction
+        # If STILL no facts, try once more with explicit force-JSON prompt
         if not facts:
             logger.debug("Continuation also yielded no facts — trying force-JSON prompt")
             try:
                 force_resp = client.chat(
                     messages=[
                         {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": chunk_text},
                         {"role": "user", "content": (
-                            "You already analysed the document above. "
-                            "Now output ONLY the JSON object with the facts you found. "
+                            "Now output ONLY the JSON object with the facts you found "
+                            "in the document above. "
                             'Format: {"facts": [{"title": "...", "subject": "...", '
                             '"predicate": "...", "object": "...", "evidence_span": "...", '
                             '"confidence": 85, "description": "...", "tags": [...]}, ...]}'
@@ -208,6 +211,7 @@ def _extract_one_round(
                     max_tokens=8192,
                     temperature=0.1,
                     extra_body={"enable_thinking": False},
+                    response_format={"type": "json_object"},
                 )
                 force_dicts = _incremental_json_parse(force_resp.content)
                 facts.extend(Fact.from_dict(d) for d in force_dicts)

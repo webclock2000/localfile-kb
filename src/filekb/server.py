@@ -18,17 +18,16 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import filekb.extractor as extractor
+import filekb.parser as parser
+import filekb.splitter as splitter
+import filekb.watcher as watcher
 from filekb.config import Config, load_config
 from filekb.embed import configure as embed_configure
 from filekb.graph_store import GraphStore
 from filekb.llm import LLMClient
 from filekb.store import Store
 from filekb.vector_store import VectorStore
-import filekb.watcher as watcher
-import filekb.parser as parser
-import filekb.splitter as splitter
-import filekb.extractor as extractor
-import filekb.dedup as dedup
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +82,18 @@ def _init_kb_state(app: FastAPI, kb_name: str) -> None:
     store = Store(db_path)
     vs = VectorStore(dimension=1024)
     if not vs.load(faiss_dir):
+        # Backfill: compute embeddings if facts exist but FAISS is empty
+        fact_count = store.get_fact_count()
+        if fact_count > 0:
+            logger.info(
+                "KB '%s': no saved FAISS index, backfilling %d fact embeddings...",
+                kb_name, fact_count,
+            )
+            _compute_embeddings_for_kb(store)
         vs.rebuild_from_sqlite(store)
+        vs.save(faiss_dir)
+        logger.info("KB '%s': FAISS saved to %s", kb_name, faiss_dir)
+
     gs = GraphStore()
     _rebuild_graph_for_kb(store, gs)
 
@@ -137,21 +147,8 @@ async def lifespan(app: FastAPI):
     app.state.kb_vector_stores: dict[str, VectorStore] = {}
     app.state.kb_graph_stores: dict[str, GraphStore] = {}
 
-    db_base = str(Path(cfg.database.path).expanduser().parent)
-
     for kb_name in app.state.kb_names:
-        db_path = kb_name == "默认" and cfg.database.path or _kb_db_path(db_base, kb_name)
-        store = Store(db_path)
-        vs = VectorStore(dimension=1024)
-        faiss_dir = _kb_faiss_dir(db_base, kb_name)
-        if not vs.load(faiss_dir):
-            vs.rebuild_from_sqlite(store)
-        gs = GraphStore()
-        _rebuild_graph_for_kb(store, gs)
-
-        app.state.kb_stores[kb_name] = store
-        app.state.kb_vector_stores[kb_name] = vs
-        app.state.kb_graph_stores[kb_name] = gs
+        _init_kb_state(app, kb_name)
 
     logger.info("FileKB server started: %d KB(s) — %s",
                 len(app.state.kb_names), ", ".join(app.state.kb_names))
@@ -179,6 +176,47 @@ def _rebuild_graph_for_kb(store: Store, gs: GraphStore):
     ).fetchall()
     gs.rebuild_from_facts([dict(r) for r in rows])
     logger.debug("Graph rebuilt: %d nodes, %d edges", gs.node_count, gs.edge_count)
+
+
+def _compute_embeddings_for_kb(store: Store) -> int:
+    """Compute and persist embeddings for all facts that lack them.
+
+    Returns number of facts updated.
+    """
+    from filekb.embed import embed_fact
+
+    batch_size = 100
+    updated = 0
+    total_without = 0
+
+    while True:
+        batch = store.get_facts_without_embeddings(limit=batch_size, offset=0)
+        if not batch:
+            break
+
+        total_without += len(batch)
+
+        for row in batch:
+            fact_id = row["id"]
+            subject = row["subject"] or ""
+            predicate = row["predicate"] or ""
+            obj = row["object"] or ""
+            title = row["title"] or ""
+            description = row["description"] or ""
+
+            try:
+                emb_bytes = embed_fact(subject, predicate, obj, title, description)
+                store.update_fact_embedding(fact_id, emb_bytes)
+                updated += 1
+            except Exception as exc:
+                logger.error("Embedding failed for fact %d: %s", fact_id, exc)
+
+        store.conn.commit()
+        logger.debug("Embeddings progress: %d/%d facts", updated, total_without)
+
+    if updated:
+        logger.info("Computed %d embeddings for KB", updated)
+    return updated
 
 
 # ============================================================================
@@ -297,8 +335,8 @@ def ask_endpoint(req: AskRequest, request: Request):
 
 @app.post("/ask/stream")
 async def ask_stream_endpoint(req: AskRequest, request: Request):
-    from filekb.query import query as run_query
     from filekb.extractor import _load_prompt
+    from filekb.query import query as run_query
 
     kb = _resolve_kb(request, req.kb)
     store = _kb_store(request, kb)
@@ -632,15 +670,22 @@ def _run_index_pipeline(
             except Exception as del_err:
                 logger.error("Failed to soft-delete %s: %s", deleted_path, del_err)
 
-        # ── 5. Rebuild search indices ──
+        # ── 5. Compute & persist embeddings ──
+        if files_changed > 0:
+            logger.info("Computing embeddings for new facts...")
+            _compute_embeddings_for_kb(store)
+
+        # ── 6. Rebuild search indices ──
         if files_changed > 0:
             logger.info("Rebuilding FAISS index and knowledge graph...")
             vs.rebuild_from_sqlite(store)
+            faiss_dir = _kb_faiss_dir(str(Path(cfg.database.path).expanduser().parent), kb_name)
+            vs.save(faiss_dir)
             _rebuild_graph_for_kb(store, gs)
             logger.info("Indices rebuilt: %d vectors, %d nodes, %d edges",
                         vs.size, gs.node_count, gs.edge_count)
 
-        # ── 6. Finalize run ──
+        # ── 7. Finalize run ──
         store.update_run(
             run_id,
             files_total=total_files,
@@ -654,7 +699,7 @@ def _run_index_pipeline(
             run_id, total_files, files_skipped, total_facts,
         )
 
-        # ── 7. Entity resolution (if enabled) ──
+        # ── 8. Entity resolution (if enabled) ──
         entity_proposals = 0
         entity_merged = 0
         if cfg.personalization.analyzer.run_after_index and gs.node_count > 1:
@@ -685,6 +730,18 @@ def _run_index_pipeline(
             except Exception as e:
                 logger.exception("Entity resolution failed (non-fatal): %s", e)
 
+        # ── 9. Entity QA — suspect detection (zero LLM cost) ──
+        entity_suspects = 0
+        if gs.node_count > 0:
+            from filekb.personalization import generate_suspect_proposals
+            logger.info("Running entity quality assessment...")
+            try:
+                suspects = generate_suspect_proposals(store, gs)
+                entity_suspects = len(suspects)
+                logger.info("Entity QA done: %d suspects found", entity_suspects)
+            except Exception as e:
+                logger.exception("Entity QA failed (non-fatal): %s", e)
+
         return {
             "run_id": run_id,
             "files_processed": total_files,
@@ -695,9 +752,10 @@ def _run_index_pipeline(
             "skip_reasons": skip_reasons,
             "entity_proposals": entity_proposals,
             "entity_merged": entity_merged,
+            "entity_suspects": entity_suspects,
         }
 
-    except Exception as e:
+    except Exception:
         logger.exception("Index pipeline crashed for KB '%s'", kb_name)
         try:
             store.update_run(run_id, files_total=total_files, files_changed=files_changed,
@@ -908,6 +966,7 @@ def reindex_single_file(file_id: int, request: Request, kb: str = Query(default=
         # Reset file state
         store.update_file_status(file_id, "processing")
         store.soft_delete_facts_by_file(file_id)
+        store.delete_chunks_by_file(file_id)  # Fix 2: prevent chunk leak
 
         # Check file size
         file_size = file_path.stat().st_size
@@ -979,9 +1038,22 @@ def reindex_single_file(file_id: int, request: Request, kb: str = Query(default=
 
         store.mark_file_indexed(file_id)
 
-        # Rebuild indices
+        # Compute embeddings for new facts then rebuild indices
+        _compute_embeddings_for_kb(store)
         vs.rebuild_from_sqlite(store)
+        faiss_dir = _kb_faiss_dir(str(Path(cfg.database.path).expanduser().parent), kb)
+        vs.save(faiss_dir)
         _rebuild_graph_for_kb(store, gs)
+
+        # Run entity QA on the updated graph
+        entity_suspects = 0
+        if gs.node_count > 0:
+            from filekb.personalization import generate_suspect_proposals
+            try:
+                suspects = generate_suspect_proposals(store, gs)
+                entity_suspects = len(suspects)
+            except Exception as e:
+                logger.exception("Entity QA failed during single-file reindex: %s", e)
 
         logger.info("Single-file reindex done: %s → %d facts", file_path.name, file_facts)
         return {
@@ -1018,12 +1090,30 @@ def feedback_endpoint(req: FeedbackRequest, request: Request):
 
 
 @app.get("/entities/proposals")
-def entity_proposals_endpoint(request: Request, status: str = Query(default="proposed"), kb: str = Query(default="默认")):
+def entity_proposals_endpoint(
+    request: Request,
+    status: str = Query(default="proposed"),
+    proposal_type: str = Query(default="merge", description="merge | suspect"),
+    kb: str = Query(default="默认"),
+):
     kb = _resolve_kb(request, kb)
-    rows = _kb_store(request, kb).get_pending_proposals()
-    return {"proposals": [{"id": r["id"], "entity_a": r["entity_a"], "entity_b": r["entity_b"],
-                           "proposed_name": r["proposed_name"], "confidence": r["confidence"],
-                           "status": r["status"]} for r in rows]}
+    rows = _kb_store(request, kb).get_pending_proposals(proposal_type=proposal_type)
+    return {
+        "proposals": [
+            {
+                "id": r["id"],
+                "entity_a": r["entity_a"],
+                "entity_b": r["entity_b"],
+                "proposed_name": r["proposed_name"],
+                "confidence": r["confidence"],
+                "status": r["status"],
+                "proposal_type": r["proposal_type"],
+                "llm_response": r["llm_response"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    }
 
 
 # ============================================================================
@@ -1060,6 +1150,105 @@ def entity_merge_endpoint(req: EntityMergeRequest, request: Request):
 def entity_reject_endpoint(req: EntityMergeRequest, request: Request):
     kb = _resolve_kb(request, req.kb)
     _kb_store(request, kb).update_proposal_status(req.proposal_id, "rejected")
+    return {"status": "ok"}
+
+
+# ============================================================================
+# Suspect entity review endpoints
+# ============================================================================
+
+
+class SuspectScanRequest(BaseModel):
+    kb: str = Field(default="默认")
+
+
+class EntityRenameRequest(BaseModel):
+    entity_name: str
+    new_name: str
+    proposal_id: int | None = None  # mark proposal as done too
+    kb: str = Field(default="默认")
+
+
+class EntityDeleteRequest(BaseModel):
+    entity_name: str
+    proposal_id: int | None = None
+    kb: str = Field(default="默认")
+
+
+@app.post("/entities/suspects/scan")
+def suspect_scan_endpoint(req: SuspectScanRequest, request: Request):
+    """Run entity QA detection and queue suspects for review."""
+    kb = _resolve_kb(request, req.kb)
+    store = _kb_store(request, kb)
+    gs = _kb_gs(request, kb)
+
+    from filekb.personalization import generate_suspect_proposals
+    suspects = generate_suspect_proposals(store, gs)
+
+    return {
+        "status": "ok",
+        "entities_scanned": gs.node_count,
+        "suspects_found": len(suspects),
+        "suspects": [
+            {
+                "entity": s["entity"],
+                "flags": s["flags"],
+                "gibberish_score": s["gibberish_score"],
+                "reason": s["reason"],
+            }
+            for s in suspects
+        ],
+    }
+
+
+@app.post("/entities/rename")
+def entity_rename_endpoint(req: EntityRenameRequest, request: Request):
+    """Rename an entity across all facts, update graph, and resolve proposal."""
+    kb = _resolve_kb(request, req.kb)
+    store = _kb_store(request, kb)
+    gs = _kb_gs(request, kb)
+
+    if not req.new_name or not req.new_name.strip():
+        raise HTTPException(400, "新名称不能为空")
+
+    updated = store.rename_entity(req.entity_name, req.new_name.strip())
+
+    # Update graph: merge old entity into new
+    if req.entity_name in gs.graph and req.new_name != req.entity_name:
+        gs.merge_entities(req.entity_name, req.new_name.strip())
+
+    # Mark proposal as resolved if given
+    if req.proposal_id is not None:
+        store.update_proposal_status(req.proposal_id, "approved")
+
+    return {"status": "ok", "facts_updated": updated}
+
+
+@app.post("/entities/delete")
+def entity_delete_endpoint(req: EntityDeleteRequest, request: Request):
+    """Soft-delete all facts for an entity and remove from graph."""
+    kb = _resolve_kb(request, req.kb)
+    store = _kb_store(request, kb)
+    gs = _kb_gs(request, kb)
+
+    deleted = store.delete_entity_facts(req.entity_name)
+
+    # Remove from graph
+    if req.entity_name in gs.graph:
+        gs.graph.remove_node(req.entity_name)
+
+    # Mark proposal as resolved if given
+    if req.proposal_id is not None:
+        store.update_proposal_status(req.proposal_id, "approved")
+
+    return {"status": "ok", "facts_deleted": deleted}
+
+
+@app.post("/entities/suspects/{proposal_id}/ignore")
+def suspect_ignore_endpoint(proposal_id: int, request: Request, kb: str = Query(default="默认")):
+    """Dismiss a suspect flag without changes — mark proposal as rejected."""
+    kb = _resolve_kb(request, kb)
+    _kb_store(request, kb).update_proposal_status(proposal_id, "rejected")
     return {"status": "ok"}
 
 

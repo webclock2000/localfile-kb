@@ -112,6 +112,7 @@ class LLMClient:
         temperature: float = 0.3,
         stream: bool = False,
         extra_body: dict[str, Any] | None = None,
+        response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Send a chat completion request with automatic retry.
 
@@ -122,11 +123,12 @@ class LLMClient:
             stream: Whether to stream the response.
             extra_body: Additional JSON fields to merge into the request body
                         (e.g. {"enable_thinking": False} for oMLX).
+            response_format: Optional response_format dict (e.g. {"type": "json_object"}).
 
         Returns:
             LLMResponse with content and metadata.
         """
-        return self._chat_with_retry(messages, max_tokens, temperature, stream, extra_body)
+        return self._chat_with_retry(messages, max_tokens, temperature, stream, extra_body, response_format)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -142,6 +144,7 @@ class LLMClient:
         temperature: float,
         stream: bool,
         extra_body: dict[str, Any] | None = None,
+        response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Internal method with tenacity retry decorator."""
         payload: dict[str, Any] = {
@@ -153,6 +156,8 @@ class LLMClient:
         }
         if extra_body:
             payload.update(extra_body)
+        if response_format:
+            payload["response_format"] = response_format
 
         response = self._client.post("/chat/completions", json=payload)
         response.raise_for_status()
@@ -246,7 +251,13 @@ class LLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": chunk_text},
         ]
-        return self.chat(messages, max_tokens=max_tokens, temperature=temperature, extra_body=extra_body)
+        return self.chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_body=extra_body,
+            response_format={"type": "json_object"},
+        )
 
     def generate_answer(
         self,
@@ -275,26 +286,49 @@ class LLMClient:
         self,
         partial_json: str,
         system_prompt: str,
+        chunk_text: str = "",
         max_tokens: int = 2048,
         extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Continue generation after a truncated JSON response.
 
-        Used when finish_reason == 'length'. Sends the partial output
-        back with a continuation instruction.
+        Used when finish_reason == 'length'. Includes the original document
+        text so the LLM has full context to continue extraction.
         """
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                "Your previous response was cut off before you could output "
-                "the JSON facts. Output ONLY the JSON object now — no reasoning, "
-                "no explanation, just pure JSON with the facts you identified.\n\n"
-                'Required format: {"facts": [{"title": "...", "subject": "...", '
-                '"predicate": "...", "object": "...", "evidence_span": "...", '
-                '"confidence": <0-100>, "description": "...", "tags": [...]}, ...]}'
-            )},
-        ]
-        return self.chat(messages, max_tokens=max_tokens, temperature=0.3, extra_body=extra_body)
+        if chunk_text:
+            # Full recovery: re-send original document + partial response,
+            # ask LLM to continue from where it left off
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chunk_text},
+                {"role": "assistant", "content": partial_json},
+                {"role": "user", "content": (
+                    "Your response above was cut off. Continue outputting "
+                    "the REMAINING JSON facts only — do NOT repeat facts you "
+                    "already output above. No reasoning, no explanation, "
+                    "just the remaining facts in the same JSON format."
+                )},
+            ]
+        else:
+            # Fallback (no chunk text available): generic continuation
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": (
+                    "Your previous response was cut off before you could output "
+                    "the JSON facts. Output ONLY the JSON object now — no reasoning, "
+                    "no explanation, just pure JSON with the facts you identified.\n\n"
+                    'Required format: {"facts": [{"title": "...", "subject": "...", '
+                    '"predicate": "...", "object": "...", "evidence_span": "...", '
+                    '"confidence": <0-100>, "description": "...", "tags": [...]}, ...]}'
+                )},
+            ]
+        return self.chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
+            extra_body=extra_body,
+            response_format={"type": "json_object"},
+        )
 
     # ------------------------------------------------------------------
     # Health check

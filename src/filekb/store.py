@@ -19,7 +19,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ============================================================================
@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at TEXT DEFAULT (datetime('now')),
     finished_at TEXT
 );
+"""
+
+SCHEMA_V3 = """
+ALTER TABLE entity_proposals ADD COLUMN proposal_type TEXT DEFAULT 'merge';
 """
 
 SCHEMA_V2 = """
@@ -189,8 +193,13 @@ class Store:
             current = 1
         if current < 2:
             self.conn.executescript(SCHEMA_V2)
-            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            logger.info(f"Migrated DB to schema v{SCHEMA_VERSION}")
+            self.conn.execute("PRAGMA user_version = 2")
+            logger.info("Migrated DB to schema v2")
+            current = 2
+        if current < 3:
+            self.conn.executescript(SCHEMA_V3)
+            self.conn.execute("PRAGMA user_version = 3")
+            logger.info("Migrated DB to schema v3")
 
     # ------------------------------------------------------------------
     # Directory CRUD
@@ -446,11 +455,34 @@ class Store:
             "SELECT COUNT(*) FROM facts WHERE status = 'active'"
         ).fetchone()[0]
 
+    def get_facts_without_embeddings(
+        self, limit: int = 200, offset: int = 0
+    ) -> list[sqlite3.Row]:
+        """Return active facts whose embedding column is NULL."""
+        return self.conn.execute(
+            """SELECT id, subject, predicate, object, title, description
+               FROM facts WHERE status = 'active' AND embedding IS NULL
+               ORDER BY id LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+
+    def update_fact_embedding(self, fact_id: int, embedding: bytes) -> None:
+        """Store embedding bytes for a fact."""
+        self.conn.execute(
+            "UPDATE facts SET embedding = ? WHERE id = ?", (embedding, fact_id)
+        )
+
     def soft_delete_facts_by_file(self, file_id: int) -> None:
         self.conn.execute(
             "UPDATE facts SET status = 'deleted' WHERE file_id = ?", (file_id,)
         )
         self.conn.commit()
+
+    def delete_chunks_by_file(self, file_id: int) -> int:
+        """Hard-delete all chunks for a file. Returns count deleted."""
+        cur = self.conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+        self.conn.commit()
+        return cur.rowcount
 
     def update_user_score(self, fact_id: int, delta: float) -> None:
         self.conn.execute(
@@ -544,18 +576,42 @@ class Store:
         proposed_name: str | None = None,
         llm_response: str | None = None,
         status: str = "proposed",
+        proposal_type: str = "merge",
     ) -> int:
         self.conn.execute(
-            """INSERT INTO entity_proposals (entity_a, entity_b, proposed_name, confidence, llm_response, status)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (entity_a, entity_b, proposed_name, confidence, llm_response, status),
+            """INSERT INTO entity_proposals
+               (entity_a, entity_b, proposed_name, confidence, llm_response, status, proposal_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (entity_a, entity_b, proposed_name, confidence, llm_response, status, proposal_type),
         )
         self.conn.commit()
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    def get_pending_proposals(self) -> list[sqlite3.Row]:
+    def get_pending_proposals(
+        self, proposal_type: str | None = None
+    ) -> list[sqlite3.Row]:
+        if proposal_type:
+            return self.conn.execute(
+                """SELECT * FROM entity_proposals
+                   WHERE status = 'proposed' AND proposal_type = ?
+                   ORDER BY confidence DESC""",
+                (proposal_type,),
+            ).fetchall()
         return self.conn.execute(
             "SELECT * FROM entity_proposals WHERE status = 'proposed' ORDER BY confidence DESC"
+        ).fetchall()
+
+    def get_all_proposals(
+        self, proposal_type: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Get all proposals (any status), optionally filtered by type."""
+        if proposal_type:
+            return self.conn.execute(
+                "SELECT * FROM entity_proposals WHERE proposal_type = ? ORDER BY created_at DESC",
+                (proposal_type,),
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM entity_proposals ORDER BY created_at DESC"
         ).fetchall()
 
     def update_proposal_status(self, proposal_id: int, status: str) -> None:
@@ -564,6 +620,44 @@ class Store:
             (status, proposal_id),
         )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Entity rename / delete (for suspect entity review)
+    # ------------------------------------------------------------------
+
+    def rename_entity(self, old_name: str, new_name: str) -> int:
+        """Rename an entity in all active facts (subject + object columns).
+
+        Returns number of fact rows updated.
+        """
+        updated = 0
+        cur = self.conn.execute(
+            "UPDATE facts SET subject = ? WHERE subject = ? AND status = 'active'",
+            (new_name, old_name),
+        )
+        updated += cur.rowcount
+        cur = self.conn.execute(
+            "UPDATE facts SET object = ? WHERE object = ? AND status = 'active'",
+            (new_name, old_name),
+        )
+        updated += cur.rowcount
+        self.conn.commit()
+        logger.info("Entity renamed: '%s' → '%s' (%d facts updated)", old_name, new_name, updated)
+        return updated
+
+    def delete_entity_facts(self, entity_name: str) -> int:
+        """Soft-delete all facts involving an entity.
+
+        Returns number of facts soft-deleted.
+        """
+        cur = self.conn.execute(
+            """UPDATE facts SET status = 'deleted'
+               WHERE status = 'active' AND (subject = ? OR object = ?)""",
+            (entity_name, entity_name),
+        )
+        self.conn.commit()
+        logger.info("Entity facts soft-deleted: '%s' → %d facts", entity_name, cur.rowcount)
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # DLQ (failed_chunks)

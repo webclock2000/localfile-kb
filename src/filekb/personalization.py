@@ -269,6 +269,7 @@ def validate_with_llm(
                     )},
                 ],
                 max_tokens=256,
+                response_format={"type": "json_object"},
             )
             judgment = json.loads(response.content)
             prop["llm_judgment"] = judgment.get("same", False)
@@ -360,6 +361,123 @@ def apply_merges(
             )
 
     return merged
+
+
+# ============================================================================
+# Entity quality assessment — suspect entity detection
+# ============================================================================
+
+
+def generate_suspect_proposals(
+    store: Store,
+    graph_store: Any,
+    *,
+    ocr_file_patterns: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Run entity QA detection rules and queue suspects for human review.
+
+    This is a pure-local pipeline (zero LLM cost) that flags entities
+    likely to be OCR errors, gibberish, or other low-quality data.
+
+    Detection rules (see entity_qa.py for details):
+    - Character count anomalies
+    - Gibberish score (entropy, Unicode ranges, repeated n-grams)
+    - Jieba word validity (Chinese)
+    - Graph isolation (degree=0)
+    - OCR-only source
+
+    Flagged entities are inserted into entity_proposals table with
+    proposal_type='suspect' for UI review.
+
+    Args:
+        store: Store instance.
+        graph_store: GraphStore instance.
+        ocr_file_patterns: If provided, file paths matching these patterns
+            are treated as OCR-sourced. If None, auto-detection is used.
+
+    Returns:
+        List of suspect check results (those queued for review).
+    """
+    from filekb.entity_qa import check_entity, compute_gibberish_score
+
+    entities = graph_store.all_entities()
+    if not entities:
+        logger.info("No entities to scan for quality issues")
+        return []
+
+    # Build entity → sources mapping from facts table
+    entity_sources: dict[str, list[str]] = {}
+    rows = store.conn.execute(
+        """SELECT subject, object, f.path AS source
+           FROM facts fa
+           JOIN files f ON fa.file_id = f.id
+           WHERE fa.status = 'active'"""
+    ).fetchall()
+    for row in rows:
+        for entity_key in (row["subject"], row["object"]):
+            if entity_key not in entity_sources:
+                entity_sources[entity_key] = []
+            src = row["source"]
+            if src and src not in entity_sources[entity_key]:
+                entity_sources[entity_key].append(src)
+
+    # Identify OCR-recovered files
+    ocr_files: set[str] = set()
+    if ocr_file_patterns:
+        # User-specified patterns
+        for src_list in entity_sources.values():
+            for src in src_list:
+                if any(pattern in src for pattern in ocr_file_patterns):
+                    ocr_files.add(src)
+    else:
+        # Auto-detect: files that went through OCR recovery
+        # (marked with _ocr suffix or logged as OCR recovery)
+        ocr_rows = store.conn.execute(
+            "SELECT path FROM files WHERE error_msg LIKE '%OCR%'"
+        ).fetchall()
+        ocr_files = {r["path"] for r in ocr_rows}
+
+    # Build graph degree map
+    graph_degrees: dict[str, int] = {}
+    for entity in entities:
+        graph_degrees[entity] = graph_store.graph.degree(entity) if hasattr(graph_store, 'graph') else 0
+
+    # Run detection
+    from filekb.entity_qa import scan_entities
+    suspects = scan_entities(
+        entities,
+        graph_degrees=graph_degrees,
+        entity_sources=entity_sources,
+        ocr_files=ocr_files,
+    )
+
+    # Insert suspect proposals into DB
+    queued = 0
+    for suspect in suspects:
+        # Check if already proposed for this entity
+        existing = store.conn.execute(
+            """SELECT id FROM entity_proposals
+               WHERE entity_a = ? AND proposal_type = 'suspect' AND status = 'proposed'""",
+            (suspect["entity"],),
+        ).fetchone()
+        if existing:
+            continue
+
+        store.insert_proposal(
+            entity_a=suspect["entity"],
+            entity_b="",  # suspect proposals have no pair
+            confidence=1.0 - suspect["gibberish_score"],
+            proposed_name=None,
+            llm_response=json.dumps(suspect, ensure_ascii=False),
+            status="proposed",
+            proposal_type="suspect",
+        )
+        queued += 1
+
+    logger.info("Entity QA: %d entities scanned, %d suspects found, %d new proposals queued",
+                len(entities), len(suspects), queued)
+
+    return suspects
 
 
 # ============================================================================
