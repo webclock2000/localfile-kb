@@ -107,7 +107,16 @@ def _init_kb_state(app: FastAPI, kb_name: str) -> None:
 
 
 def _remove_kb_state(app: FastAPI, kb_name: str) -> None:
-    """Close and remove per-KB state for *kb_name*."""
+    """Close and remove per-KB state for *kb_name*, including on-disk data."""
+    import os
+    import shutil
+
+    cfg = app.state.config
+    db_base = str(Path(cfg.database.path).expanduser().parent)
+    db_path = kb_name == "默认" and cfg.database.path or _kb_db_path(db_base, kb_name)
+    faiss_dir = _kb_faiss_dir(db_base, kb_name)
+
+    # 1. Close in-memory state
     for attr, label in [
         ("kb_stores", "store"),
         ("kb_vector_stores", "vector"),
@@ -119,7 +128,27 @@ def _remove_kb_state(app: FastAPI, kb_name: str) -> None:
             obj.close()
     if kb_name in app.state.kb_names:
         app.state.kb_names.remove(kb_name)
-    logger.info("KB '%s' state removed", kb_name)
+
+    # 2. Delete on-disk data (SQLite + WAL/SHM + FAISS index)
+    for label, path in [
+        ("DB", db_path),
+        ("DB-WAL", db_path + "-wal"),
+        ("DB-SHM", db_path + "-shm"),
+    ]:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to delete %s %s: %s", label, path, e)
+
+    if os.path.isdir(faiss_dir):
+        try:
+            shutil.rmtree(faiss_dir)
+        except OSError as e:
+            logger.warning("Failed to delete FAISS dir %s: %s", faiss_dir, e)
+
+    logger.info("KB '%s' state and data removed", kb_name)
 
 
 @asynccontextmanager
