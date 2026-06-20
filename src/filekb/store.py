@@ -491,6 +491,21 @@ class Store:
         )
         self.conn.commit()
 
+    def get_user_scores(self, fact_ids: list[int]) -> dict[int, float]:
+        """Bulk-fetch user_scores for a list of fact IDs.
+
+        Returns:
+            {fact_id: user_score} dict. Missing IDs are absent (caller should default to 1.0).
+        """
+        if not fact_ids:
+            return {}
+        placeholders = ",".join("?" * len(fact_ids))
+        rows = self.conn.execute(
+            f"SELECT id, user_score FROM facts WHERE id IN ({placeholders})",
+            tuple(fact_ids),
+        ).fetchall()
+        return {row["id"]: row["user_score"] for row in rows}
+
     def apply_score_decay(self, decay_rate: float) -> int:
         """Decay all user_scores toward 1.0. Returns count of updated rows."""
         cur = self.conn.execute(

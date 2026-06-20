@@ -14,6 +14,7 @@ Per DEVELOPMENT_V3.md §7.2 / §4.3.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +62,7 @@ def _reciprocal_rank_fusion(
     fts_results: list[dict[str, Any]],
     graph_results: list[dict[str, Any]],
     *,
+    store: Store,
     vector_weight: float = 0.5,
     graph_weight: float = 0.3,
     fts_weight: float = 0.2,
@@ -73,6 +75,7 @@ def _reciprocal_rank_fusion(
         vector_results: [(fact_id, similarity_score), ...]
         fts_results: [{"id": int, ...}, ...]
         graph_results: [{"fact_id": int, "distance": int}, ...]
+        store: Store instance for fetching per-fact user_score.
         vector_weight: Weight for vector similarity.
         graph_weight: Weight for graph proximity.
         fts_weight: Weight for full-text search.
@@ -102,11 +105,19 @@ def _reciprocal_rank_fusion(
             proximity = 1.0 / (1.0 + item.get("distance", 1))
             scores[fid] = scores.get(fid, 0) + graph_weight * proximity
 
-    # Apply user_score boost separately
-    for fid in list(scores.keys()):
-        # user_score boost is applied as a gentle multiplier (log)
-        # Full user_score is fetched from DB — here we use the base
-        pass
+    # Apply user_score boost — log(user_score) so:
+    #   - score > 1.0 → positive boost (gentle lift)
+    #   - score < 1.0 → negative penalty (sinks toward irrelevance)
+    #   - score = 1.0 → neutral  (log(1.0) = 0, no effect)
+    # weight is small (default 0.1) to prevent feedback loops from
+    # overpowering retrieval signal.
+    if user_score_weight > 0 and scores:
+        all_fids = list(scores.keys())
+        user_scores = store.get_user_scores(all_fids)
+        for fid in all_fids:
+            us = user_scores.get(fid, 1.0)
+            if us != 1.0:
+                scores[fid] += user_score_weight * math.log(max(us, 0.01))
 
     # Sort by combined score descending
     merged = sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -175,6 +186,7 @@ def query(
         vector_results,
         fts_results,
         [],  # Graph results populated below
+        store=store,
         vector_weight=vector_weight,
         graph_weight=graph_weight,
         fts_weight=fts_weight,
