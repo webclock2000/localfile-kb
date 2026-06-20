@@ -216,8 +216,8 @@ resilience:
 
 ```bash
 # Clone and install in editable mode with dev deps
-git clone https://github.com/filekb-org/filekb.git
-cd filekb
+git clone https://github.com/webclock2000/localfile-kb.git
+cd localfile-kb
 pip install -e ".[dev]"
 
 # Lint
