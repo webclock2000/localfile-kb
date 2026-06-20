@@ -28,14 +28,88 @@ if "chat_sessions_loaded" not in st.session_state:
 if "chat_save_id" not in st.session_state:
     st.session_state.chat_save_id = 0   # counter to enable re-saving the same msg
 
-# Track KB switches — reset session when KB changes
+
+# ── Helper functions (defined BEFORE first use in sidebar) ──
+
+def _save_current_session(kb_name: str) -> None:
+    """Persist any unsaved last message before switching sessions."""
+    msgs = st.session_state.messages
+    if not msgs or not st.session_state.session_id:
+        return
+    # Messages are normally saved inline during chat flow,
+    # but we do a safety check: if the last message lacks _db_id, save it.
+    last = msgs[-1]
+    if "_db_id" not in last:
+        _persist_message(
+            kb_name, st.session_state.session_id,
+            last["role"], last["content"],
+            last.get("sources"), last.get("related_facts"),
+        )
+
+
+def _load_session(kb_name: str, session_id: str) -> None:
+    """Load a session's messages from the API into session_state."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/chat/history",
+            params={"session_id": session_id, "kb": kb_name},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            raw = data.get("messages", [])
+            msgs: list[dict] = []
+            for m in raw:
+                entry = {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "sources": m.get("sources", []),
+                    "related_facts": m.get("related_facts", []),
+                    "_db_id": m.get("id"),
+                }
+                if m.get("feedback_given"):
+                    entry["feedback_given"] = m["feedback_given"]
+                msgs.append(entry)
+            st.session_state.messages = msgs
+            st.session_state.session_id = session_id
+    except Exception as e:
+        st.error(f"加载会话失败: {e}")
+
+
+def _persist_message(
+    kb_name: str, session_id: str, role: str, content: str,
+    sources: list | None = None, related_facts: list | None = None,
+) -> str:
+    """Save one message to the API. Returns the session_id (may be new)."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/chat/save",
+            params={"session_id": session_id},
+            json={
+                "role": role,
+                "content": content,
+                "sources": sources or [],
+                "related_facts": related_facts or [],
+                "kb": kb_name,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("session_id", session_id)
+    except Exception:
+        pass
+    return session_id
+
+
+# ── Track KB switches — reset session when KB changes ──
 current_kb_key = f"_last_kb_chat_{id(st)}"
 prev_kb = st.session_state.get(current_kb_key, kb)
 if prev_kb != kb:
     st.session_state.messages = []
     st.session_state.session_id = ""
-    st.cache_data.clear()
     st.session_state[current_kb_key] = kb
+    st.rerun()
 
 # ── Header ──
 st.title("💬 知识库问答")
@@ -47,7 +121,7 @@ with st.sidebar:
     st.divider()
     st.markdown("#### 💬 会话历史")
 
-    # Load session list from API
+    # Load session list from API for the CURRENT kb
     sessions: list[dict] = []
     try:
         resp = requests.get(f"{API_BASE}/chat/sessions", params={"kb": kb}, timeout=5)
@@ -59,7 +133,6 @@ with st.sidebar:
     # New chat button
     if st.button("➕ 新建对话", use_container_width=True, key="new_chat_btn",
                  help="开始一个全新的对话会话。"):
-        # Auto-save current session before starting new one
         _save_current_session(kb)
         st.session_state.messages = []
         st.session_state.session_id = ""
@@ -104,75 +177,6 @@ with st.sidebar:
             st.rerun()
     else:
         st.caption("暂无历史会话。首次对话将自动保存。")
-
-
-# ── Helper functions ──
-
-def _save_current_session(kb_name: str) -> None:
-    """Persist in-memory messages to the API if there's an active session."""
-    msgs = st.session_state.messages
-    if not msgs or not st.session_state.session_id:
-        return
-    # Messages are saved incrementally during the conversation,
-    # so this is a no-op unless we need a final flush.
-    # We do a quick check: save the last message if it doesn't have a DB id.
-    pass  # messages are saved inline during the chat flow
-
-
-def _load_session(kb_name: str, session_id: str) -> None:
-    """Load a session's messages from the API into session_state."""
-    try:
-        resp = requests.get(
-            f"{API_BASE}/chat/history",
-            params={"session_id": session_id, "kb": kb_name},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            raw = data.get("messages", [])
-            # Convert to chat-ui format
-            msgs: list[dict] = []
-            for m in raw:
-                entry = {
-                    "role": m["role"],
-                    "content": m["content"],
-                    "sources": m.get("sources", []),
-                    "related_facts": m.get("related_facts", []),
-                    "_db_id": m.get("id"),
-                }
-                if m.get("feedback_given"):
-                    entry["feedback_given"] = m["feedback_given"]
-                msgs.append(entry)
-            st.session_state.messages = msgs
-            st.session_state.session_id = session_id
-    except Exception as e:
-        st.error(f"加载会话失败: {e}")
-
-
-def _persist_message(
-    kb_name: str, session_id: str, role: str, content: str,
-    sources: list | None = None, related_facts: list | None = None,
-) -> str:
-    """Save one message to the API. Returns the session_id (may be new)."""
-    try:
-        resp = requests.post(
-            f"{API_BASE}/chat/save",
-            params={"session_id": session_id},
-            json={
-                "role": role,
-                "content": content,
-                "sources": sources or [],
-                "related_facts": related_facts or [],
-                "kb": kb_name,
-            },
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("session_id", session_id)
-    except Exception:
-        pass
-    return session_id
 
 
 # ── Render existing messages ──
