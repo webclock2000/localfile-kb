@@ -81,13 +81,33 @@ try:
             st.caption(f"上次索引异常退出，处理了 {last.get('files_changed', 0)} 个文件")
 
         # ── Actions ──
+        # Check if KB has any directories configured
+        try:
+            settings_resp = requests.get(f"{API_BASE}/settings", timeout=5)
+            cfg = settings_resp.json() if settings_resp.status_code == 200 else {}
+        except Exception:
+            cfg = {}
+        dirs_for_kb = [
+            d for d in cfg.get("directories", [])
+            if d["group"] == kb
+        ]
+
+        idx_disabled = len(dirs_for_kb) == 0
+        idx_help = (
+            "扫描「{0}」的所有监控目录，检测文件变更（新增/修改/删除），"
+            "解析文件内容并通过 LLM 提取实体和关系，更新向量索引和知识图谱。"
+            "已索引且未变化的文件会被跳过。索引大量文件可能需要较长时间。".format(kb)
+        )
+
+        if idx_disabled:
+            st.warning("⚠️ 该知识库尚未配置监控目录，请先在「设置」中添加。")
+
         if st.button(
             f"🔄 索引「{kb}」知识库",
             use_container_width=True,
             type="primary",
-            help=f"扫描「{kb}」的所有监控目录，检测文件变更（新增/修改/删除），"
-            "解析文件内容并通过 LLM 提取实体和关系，更新向量索引和知识图谱。"
-            "已索引且未变化的文件会被跳过。索引大量文件可能需要较长时间。",
+            disabled=idx_disabled,
+            help=idx_help if not idx_disabled else "知识库没有监控目录，无法索引。请先在设置中添加目录。",
         ):
             with st.spinner(f"正在索引「{kb}」..."):
                 try:
