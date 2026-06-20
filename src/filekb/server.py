@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1499,3 +1500,113 @@ def settings_update(req: SettingsUpdateRequest, request: Request):
         logger.warning("Failed to persist config: %s", e)
 
     return {"status": "ok", "section": req.section}
+
+
+# ============================================================================
+# Chat history persistence
+# ============================================================================
+
+
+class ChatHistoryEntry(BaseModel):
+    id: int | None = None
+    role: str
+    content: str
+    sources: list[dict[str, Any]] = []
+    related_facts: list[dict[str, Any]] = []
+    feedback_given: str | None = None
+    created_at: str | None = None
+
+
+class ChatHistoryRequest(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str
+    sources: list[dict[str, Any]] = []
+    related_facts: list[dict[str, Any]] = []
+    kb: str = Field(default="默认")
+
+
+class ChatSessionInfo(BaseModel):
+    session_id: str
+    created_at: str
+    turns: int
+
+
+@app.get("/chat/sessions")
+def chat_sessions(request: Request, kb: str = Query(default="默认")):
+    """List all chat sessions for a KB, newest first."""
+    kb = _resolve_kb(request, kb)
+    store = _kb_store(request, kb)
+    sessions = store.get_chat_sessions(kb)
+    return {"sessions": sessions}
+
+
+@app.get("/chat/history")
+def chat_history(
+    request: Request,
+    session_id: str = Query(..., description="Session ID"),
+    kb: str = Query(default="默认"),
+):
+    """Get all messages for a chat session."""
+    kb = _resolve_kb(request, kb)
+    store = _kb_store(request, kb)
+    messages = store.get_chat_history(kb, session_id)
+
+    # Parse JSON fields for the frontend
+    import json
+    result: list[dict[str, Any]] = []
+    for m in messages:
+        entry: dict[str, Any] = {
+            "id": m["id"],
+            "role": m["role"],
+            "content": m["content"],
+            "feedback_given": m.get("feedback_given"),
+            "created_at": m.get("created_at"),
+        }
+        try:
+            entry["sources"] = json.loads(m.get("sources", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            entry["sources"] = []
+        try:
+            entry["related_facts"] = json.loads(m.get("related_facts", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            entry["related_facts"] = []
+        result.append(entry)
+
+    return {"messages": result}
+
+
+@app.post("/chat/save")
+def chat_save(req: ChatHistoryRequest, request: Request):
+    """Persist a single chat turn."""
+    import json
+    kb = _resolve_kb(request, req.kb)
+    store = _kb_store(request, kb)
+
+    # Generate or reuse session_id from query param
+    session_id = request.query_params.get("session_id", "")
+    if not session_id:
+        import uuid
+        session_id = uuid.uuid4().hex[:12]
+
+    row_id = store.save_chat_message(
+        kb_name=kb,
+        session_id=session_id,
+        role=req.role,
+        content=req.content,
+        sources=json.dumps(req.sources, ensure_ascii=False),
+        related_facts=json.dumps(req.related_facts, ensure_ascii=False),
+    )
+    return {"status": "ok", "id": row_id, "session_id": session_id}
+
+
+@app.delete("/chat/sessions/{session_id}")
+def chat_delete_session(
+    session_id: str,
+    request: Request,
+    kb: str = Query(default="默认"),
+):
+    """Delete a chat session and all its messages."""
+    kb = _resolve_kb(request, kb)
+    store = _kb_store(request, kb)
+    deleted = store.delete_chat_session(kb, session_id)
+    return {"status": "ok", "deleted": deleted}

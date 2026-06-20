@@ -99,6 +99,54 @@ SCHEMA_V3 = """
 ALTER TABLE entity_proposals ADD COLUMN proposal_type TEXT DEFAULT 'merge';
 """
 
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kb_name TEXT NOT NULL DEFAULT '默认',
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources TEXT DEFAULT '[]',
+    related_facts TEXT DEFAULT '[]',
+    feedback_given TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_history_session
+    ON chat_history(kb_name, session_id, created_at);
+"""
+
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kb_name TEXT NOT NULL DEFAULT '默认',
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources TEXT DEFAULT '[]',
+    related_facts TEXT DEFAULT '[]',
+    feedback_given TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_history_session
+    ON chat_history(kb_name, session_id, created_at);
+"""
+
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kb_name TEXT NOT NULL DEFAULT '默认',
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources TEXT DEFAULT '[]',
+    related_facts TEXT DEFAULT '[]',
+    feedback_given TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_history_session
+    ON chat_history(kb_name, session_id, created_at);
+"""
+
 SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS user_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,6 +248,11 @@ class Store:
             self.conn.executescript(SCHEMA_V3)
             self.conn.execute("PRAGMA user_version = 3")
             logger.info("Migrated DB to schema v3")
+            current = 3
+        if current < 4:
+            self.conn.executescript(SCHEMA_V4)
+            self.conn.execute("PRAGMA user_version = 4")
+            logger.info("Migrated DB to schema v4")
 
     # ------------------------------------------------------------------
     # Directory CRUD
@@ -763,6 +816,79 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    # ------------------------------------------------------------------
+    # Chat history
+    # ------------------------------------------------------------------
+
+    def save_chat_message(
+        self,
+        kb_name: str,
+        session_id: str,
+        role: str,
+        content: str,
+        sources: str | None = None,
+        related_facts: str | None = None,
+    ) -> int:
+        """Persist a single chat turn. Returns the new row ID."""
+        self.conn.execute(
+            """INSERT INTO chat_history
+               (kb_name, session_id, role, content, sources, related_facts)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (kb_name, session_id, role, content,
+             sources or "[]", related_facts or "[]"),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def update_chat_feedback(
+        self, message_id: int, feedback_type: str,
+    ) -> None:
+        """Record feedback (positive/negative) on a chat message."""
+        self.conn.execute(
+            "UPDATE chat_history SET feedback_given = ? WHERE id = ?",
+            (feedback_type, message_id),
+        )
+        self.conn.commit()
+
+    def get_chat_sessions(self, kb_name: str) -> list[dict]:
+        """Return distinct session ids + metadata for a KB, newest first."""
+        rows = self.conn.execute(
+            """SELECT session_id,
+                      MIN(created_at) AS created_at,
+                      COUNT(*)      AS turns
+               FROM chat_history
+               WHERE kb_name = ?
+               GROUP BY session_id
+               ORDER BY MAX(created_at) DESC""",
+            (kb_name,),
+        ).fetchall()
+        return [{"session_id": r["session_id"],
+                 "created_at": r["created_at"],
+                 "turns": r["turns"]} for r in rows]
+
+    def get_chat_history(
+        self, kb_name: str, session_id: str,
+    ) -> list[dict]:
+        """Return all messages for a session in chronological order."""
+        rows = self.conn.execute(
+            """SELECT id, role, content, sources, related_facts,
+                      feedback_given, created_at
+               FROM chat_history
+               WHERE kb_name = ? AND session_id = ?
+               ORDER BY id ASC""",
+            (kb_name, session_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_chat_session(self, kb_name: str, session_id: str) -> int:
+        """Delete all messages for a session. Returns count of deleted rows."""
+        cur = self.conn.execute(
+            "DELETE FROM chat_history WHERE kb_name = ? AND session_id = ?",
+            (kb_name, session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def __enter__(self) -> Store:
         return self
