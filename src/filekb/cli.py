@@ -1,7 +1,7 @@
 """CLI — Click command group for FileKB.
 
 Provides command-line equivalents to all Web UI capabilities:
-    filekb index --watch      Scan directories and index changed files
+    filekb index              Scan directories and index changed files
     filekb ask "question"     Single Q&A
     filekb graph ENTITY       Graph exploration
     filekb status             Indexing status overview
@@ -17,17 +17,37 @@ from pathlib import Path
 
 import click
 
+# Default API port — CLI talks directly to the FastAPI backend
+API_BASE = "http://localhost:9494"
+
+
+def _get_default_kb(config_path: str | None = None) -> str:
+    """Resolve the default KB name from the server, fallback to '默认'."""
+    import json
+
+    import requests
+    try:
+        resp = requests.get(f"{API_BASE}/settings", timeout=5)
+        if resp.status_code == 200:
+            return resp.json().get("kb_names", ["默认"])[0]
+    except Exception:
+        pass
+    return "默认"
+
 
 @click.group()
 @click.version_option(package_name="filekb")
-def main():
+@click.option("--kb", default=None, help="Knowledge base name (default: first available KB)")
+@click.pass_context
+def main(ctx: click.Context, kb: str | None):
     """FileKB — File-driven personal knowledge base.
 
     Monitor local directories, auto-extract structured knowledge,
     build a queryable knowledge graph, and ask natural language
     questions with full source provenance.
     """
-    pass
+    ctx.ensure_object(dict)
+    ctx.obj["kb"] = kb or _get_default_kb()
 
 
 # ============================================================================
@@ -36,111 +56,155 @@ def main():
 
 
 @main.command()
-@click.option("--watch", is_flag=True, help="Scan directories and index changed files")
+@click.option("--watch", is_flag=True, help="[PLACEHOLDER] Continuous watch mode — not yet implemented")
 @click.option("--file", "single_file", type=click.Path(exists=True), help="Index a single file (hot path)")
 @click.option("--dlq", is_flag=True, help="Retry failed chunks in the Dead Letter Queue")
 @click.option("--rebuild", is_flag=True, help="Full rebuild of all indices")
-def index(watch: bool, single_file: str | None, dlq: bool, rebuild: bool):
+@click.pass_context
+def index(ctx: click.Context, watch: bool, single_file: str | None, dlq: bool, rebuild: bool):
     """Index local files into the knowledge base."""
-    from filekb.config import load_config
+    kb = ctx.obj["kb"]
 
-    cfg = load_config()
+    if watch:
+        click.echo("Watch mode is not yet implemented. "
+                   "Use manual 'filekb index' to run a single scan.")
+        return
 
     if dlq:
-        _run_dlq(cfg)
+        _run_dlq_via_api(kb)
     elif single_file:
-        click.echo(f"Hot-path indexing not yet implemented: {single_file}")
-    elif watch or rebuild:
-        click.echo("Index run starting...")
-        _run_full_index(cfg)
+        _run_single_file(kb, single_file)
+    elif rebuild:
+        _run_full_index_via_api(kb)
     else:
-        click.echo("Use --watch, --file, --dlq, or --rebuild")
+        _run_full_index_via_api(kb)
 
 
-def _run_full_index(cfg) -> None:
-    """Execute a full index pipeline."""
-    from filekb.parser import is_supported, parse_file
-    from filekb.splitter import chunk_text
-    from filekb.store import Store
-    from filekb.watcher import detect_changes, load_previous_hashes, scan_directory
+def _run_full_index_via_api(kb: str) -> None:
+    """Trigger a full index scan via the FastAPI backend."""
+    import requests
 
-    store = Store(cfg.database.path)
-    run_id = store.start_run()
-    total_processed = 0
-
+    click.echo(f"Triggering full index for KB: {kb}")
     try:
-        for dir_cfg in cfg.directories:
-            click.echo(f"Scanning: {dir_cfg.path}")
-            current = scan_directory(
-                Path(dir_cfg.path),
-                recursive=dir_cfg.recursive,
-                exclude_patterns=set(dir_cfg.exclude_patterns),
-            )
-            previous = load_previous_hashes(store)
-            changes = detect_changes(current, previous)
-
+        resp = requests.post(
+            f"{API_BASE}/index",
+            json={"kb": kb},
+            timeout=600,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
             click.echo(
-                f"  Added: {len(changes['added'])}, "
-                f"Modified: {len(changes['modified'])}, "
-                f"Deleted: {len(changes['deleted'])}, "
-                f"Unchanged: {len(changes['unchanged'])}"
+                f"Index complete. "
+                f"Files processed: {data.get('files_processed', '?')}, "
+                f"Facts added: {data.get('facts_added', '?')}, "
+                f"Skipped: {data.get('files_skipped', 0)}"
             )
-
-            # Process added/modified files
-            for fpath in changes["added"] + changes["modified"]:
-                if not is_supported(fpath):
-                    store.upsert_file(fpath, current.get(fpath, ""), 0, status="skipped")
-                    continue
-
-                try:
-                    text = parse_file(fpath)
-                except Exception as e:
-                    click.echo(f"  SKIP {fpath}: {e}", err=True)
-                    store.upsert_file(fpath, current.get(fpath, ""), 0, status="skipped")
-                    continue
-
-                chunks = chunk_text(
-                    text,
-                    max_chars=cfg.extraction.max_chars_per_chunk,
-                    overlap_chars=cfg.extraction.overlap_chars,
-                )
-                click.echo(f"  {fpath}: {len(chunks)} chunks")
-                total_processed += 1
-
-            # Mark deleted files
-            for fpath in changes["deleted"]:
-                row = store.get_file_by_path(fpath)
-                if row:
-                    store.soft_delete_file(row["id"])
-
-        store.update_run(run_id, files_total=total_processed, files_changed=total_processed)
-        store.finish_run(run_id, "completed")
-        click.echo(f"Index complete. {total_processed} files processed.")
-
-    except Exception as e:
-        store.finish_run(run_id, "crashed")
-        click.echo(f"Index run crashed: {e}", err=True)
-        raise
-    finally:
-        store.close()
-
-
-def _run_dlq(cfg) -> None:
-    """Process the Dead Letter Queue."""
-    from filekb.resilience import build_failure_report, process_dlq
-    from filekb.store import Store
-
-    store = Store(cfg.database.path)
-    try:
-        processed = process_dlq(store, batch_size=10)
-        report = build_failure_report(store)
-        click.echo(f"DLQ processed: {processed} entries retried")
-        if report["total_failed"] > 0:
-            click.echo(f"Remaining DLQ entries: {report}")
         else:
-            click.echo("DLQ is empty")
-    finally:
-        store.close()
+            click.echo(f"Index failed: {resp.status_code} — {resp.text}", err=True)
+    except requests.exceptions.Timeout:
+        click.echo("Index job submitted (server still working). Check progress via 'filekb status'.")
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
+
+
+def _run_single_file(kb: str, file_path: str) -> None:
+    """Index a single file by uploading it through the API.
+
+    The server's /files/{id}/reindex endpoint works for already-tracked files.
+    For brand-new files, we trigger a full index targeted at that file's directory.
+    """
+    import os
+
+    import requests
+
+    abs_path = os.path.abspath(file_path)
+    click.echo(f"Indexing single file: {abs_path}")
+
+    # 1. Find which directory config covers this file
+    try:
+        resp = requests.get(f"{API_BASE}/settings", timeout=5)
+        if resp.status_code != 200:
+            click.echo("Cannot read config from server.", err=True)
+            return
+        cfg = resp.json()
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
+        return
+
+    # 2. Check if file is already tracked
+    try:
+        resp = requests.get(
+            f"{API_BASE}/files",
+            params={"kb": kb, "search": abs_path, "limit": 5},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            files = resp.json().get("files", [])
+            for f in files:
+                if f["path"] == abs_path:
+                    # Already tracked — trigger reindex
+                    click.echo(f"File already tracked (id={f['id']}, status={f['status']}). Re-indexing...")
+                    resp2 = requests.post(
+                        f"{API_BASE}/files/{f['id']}/reindex",
+                        params={"kb": kb},
+                        timeout=300,
+                    )
+                    if resp2.status_code == 200:
+                        data = resp2.json()
+                        click.echo(
+                            f"Re-indexed: {data.get('facts_added', 0)} facts added, "
+                            f"{data.get('facts_removed', 0)} removed."
+                        )
+                    else:
+                        click.echo(f"Re-index failed: {resp2.status_code}", err=True)
+                    return
+    except Exception:
+        pass
+
+    # 3. File not yet tracked — add its directory then index
+    parent_dir = os.path.dirname(abs_path)
+    click.echo(f"Adding directory to KB '{kb}': {parent_dir}")
+    try:
+        requests.post(
+            f"{API_BASE}/settings",
+            json={
+                "section": "directories",
+                "data": {
+                    "action": "add",
+                    "path": parent_dir,
+                    "group": kb,
+                    "recursive": False,
+                    "exclude_patterns": [],
+                },
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        click.echo(f"Failed to add directory: {e}", err=True)
+        return
+
+    # Now trigger a full index (the new directory will be picked up)
+    _run_full_index_via_api(kb)
+
+
+def _run_dlq_via_api(kb: str) -> None:
+    """Trigger DLQ retry via the FastAPI backend."""
+    import requests
+
+    click.echo(f"Triggering DLQ retry for KB: {kb}")
+    try:
+        resp = requests.post(
+            f"{API_BASE}/dlq/retry",
+            json={"kb": kb},
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            click.echo(f"DLQ retried: {data.get('retried', 0)} entries")
+        else:
+            click.echo(f"DLQ retry failed: {resp.status_code}", err=True)
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
 
 
 # ============================================================================
@@ -151,50 +215,33 @@ def _run_dlq(cfg) -> None:
 @main.command()
 @click.argument("question")
 @click.option("--top-k", default=20, help="Number of facts to retrieve")
-def ask(question: str, top_k: int):
+@click.pass_context
+def ask(ctx: click.Context, question: str, top_k: int):
     """Ask a natural language question."""
-    from filekb.config import load_config
-    from filekb.embed import configure as embed_configure
-    from filekb.graph_store import GraphStore
-    from filekb.llm import LLMClient
-    from filekb.query import query
-    from filekb.store import Store
-    from filekb.vector_store import VectorStore
+    import requests
 
-    cfg = load_config()
-
-    store = Store(cfg.database.path)
-    embed_configure(
-        model_name=cfg.embedding.model,
-        device=cfg.embedding.device,
-    )
-    llm = LLMClient(
-        base_url=cfg.llm.base_url,
-        model=cfg.llm.model,
-        timeout=cfg.llm.timeout,
-    )
-    vs = VectorStore()
-    faiss_dir = str(Path(cfg.database.path).parent / "faiss")
-    vs.load(faiss_dir)
-    gs = GraphStore()
-
+    kb = ctx.obj["kb"]
+    click.echo(f"🔍 [{kb}] {question}\n")
     try:
-        result = query(
-            question=question,
-            store=store,
-            vector_store=vs,
-            graph_store=gs,
-            llm_client=llm,
-            vector_top_k=top_k,
+        resp = requests.post(
+            f"{API_BASE}/ask",
+            json={"question": question, "kb": kb, "top_k": top_k},
+            timeout=120,
         )
-
-        click.echo(result.answer)
-        click.echo(f"\n---\nSources ({len(result.sources)}):")
-        for src in result.sources:
-            click.echo(f"  {src['file']}")
-    finally:
-        store.close()
-        llm.close()
+        if resp.status_code == 200:
+            data = resp.json()
+            click.echo(data.get("answer", "No answer."))
+            sources = data.get("sources", [])
+            if sources:
+                click.echo(f"\n--- 参考来源 ({len(sources)}) ---")
+                for src in sources:
+                    click.echo(f"  📄 {src.get('file', '?')}")
+        else:
+            click.echo(f"API error: {resp.status_code} — {resp.text}", err=True)
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
+    except requests.exceptions.Timeout:
+        click.echo("Request timed out. The server may still be processing.", err=True)
 
 
 # ============================================================================
@@ -205,27 +252,35 @@ def ask(question: str, top_k: int):
 @main.command()
 @click.argument("entity")
 @click.option("--hop", default=1, help="Number of BFS hops")
-def graph(entity: str, hop: int):
+@click.pass_context
+def graph(ctx: click.Context, entity: str, hop: int):
     """Explore the knowledge graph around an entity."""
-    from filekb.config import load_config
-    from filekb.graph_store import GraphStore
-    from filekb.store import Store
+    import requests
 
-    cfg = load_config()
-    store = Store(cfg.database.path)
-    gs = GraphStore()
-
+    kb = ctx.obj["kb"]
+    click.echo(f"🔗 [{kb}] Exploring '{entity}' (hop={hop})\n")
     try:
-        result = gs.expand(entity, hops=hop)
-        click.echo(f"Entity: {entity}")
-        click.echo(f"Nodes ({len(result['nodes'])}):")
-        for n in result["nodes"][:20]:
-            click.echo(f"  {n['name']} (degree={n['degree']})")
-        click.echo(f"Edges ({len(result['edges'])}):")
-        for e in result["edges"][:20]:
-            click.echo(f"  {e['source']} --[{e['predicate']}]--> {e['target']}")
-    finally:
-        store.close()
+        resp = requests.get(
+            f"{API_BASE}/graph",
+            params={"entity": entity, "hop": hop, "kb": kb},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            nodes = data.get("nodes", [])
+            edges = data.get("edges", [])
+            click.echo(f"Nodes ({len(nodes)}):")
+            for n in nodes[:20]:
+                click.echo(f"  🏷️  {n['name']} (degree={n.get('degree', 0)})")
+            click.echo(f"\nEdges ({len(edges)}):")
+            for e in edges[:20]:
+                click.echo(f"  {e['source']} --[{e.get('predicate', '?')}]--> {e['target']}")
+            if len(edges) > 20:
+                click.echo(f"  ... and {len(edges) - 20} more edges")
+        else:
+            click.echo(f"API error: {resp.status_code}", err=True)
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
 
 
 # ============================================================================
@@ -235,40 +290,50 @@ def graph(entity: str, hop: int):
 
 @main.command()
 @click.option("--skipped", is_flag=True, help="List skipped files")
-def status(skipped: bool):
+@click.pass_context
+def status(ctx: click.Context, skipped: bool):
     """Show indexing status overview."""
-    from filekb.config import load_config
-    from filekb.store import Store
+    import requests
 
-    cfg = load_config()
-    store = Store(cfg.database.path)
-
+    kb = ctx.obj["kb"]
     try:
-        total_files = store.get_file_count()
-        total_facts = store.get_fact_count()
-        last_run = store.get_last_run()
-
-        click.echo(f"Files indexed: {total_files}")
-        click.echo(f"Facts extracted: {total_facts}")
-
-        if last_run:
-            click.echo(
-                f"Last run: {last_run['status']} "
-                f"(processed {last_run['files_changed']} files, "
-                f"added {last_run['facts_added']} facts) "
-                f"at {last_run.get('finished_at') or last_run['started_at']}"
-            )
-
-        if skipped:
-            skipped_files = store.get_files_by_status("skipped")
-            if skipped_files:
-                click.echo(f"\nSkipped files ({len(skipped_files)}):")
-                for f in skipped_files:
-                    click.echo(f"  {f['path']} — {f.get('error_msg', 'no reason')}")
-            else:
-                click.echo("No skipped files.")
-    finally:
-        store.close()
+        resp = requests.get(f"{API_BASE}/status", params={"kb": kb}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            health = data.get("health", {})
+            click.echo(f"📊 [{kb}] Status")
+            click.echo(f"  Files total:   {data.get('files_total', 0)}")
+            click.echo(f"  Facts total:   {data.get('facts_total', 0)}")
+            click.echo(f"  Entities:      {health.get('graph', {}).get('nodes', 0)}")
+            click.echo(f"  Vectors:       {health.get('faiss', {}).get('vectors', 0)}")
+            click.echo(f"  LLM server:    {'✅ 在线' if health.get('llm_server') == 'ok' else '❌ 离线'}")
+            last = data.get("last_run")
+            if last:
+                click.echo(
+                    f"\n  Last index: {last.get('status', '?')} "
+                    f"(processed {last.get('files_changed', 0)} files, "
+                    f"added {last.get('facts_added', 0)} facts)"
+                )
+            if skipped:
+                # Fetch skipped files via the files endpoint
+                resp2 = requests.get(
+                    f"{API_BASE}/files",
+                    params={"kb": kb, "status": "skipped", "limit": 200},
+                    timeout=10,
+                )
+                if resp2.status_code == 200:
+                    skip_files = resp2.json().get("files", [])
+                    if skip_files:
+                        click.echo(f"\n  Skipped files ({len(skip_files)}):")
+                        for f in skip_files:
+                            msg = f.get("error_msg", "no reason")[:80]
+                            click.echo(f"    ❌ {f['path']} — {msg}")
+                    else:
+                        click.echo("  No skipped files.")
+        else:
+            click.echo(f"API error: {resp.status_code}", err=True)
+    except requests.exceptions.ConnectionError:
+        click.echo("Cannot connect to FileKB server. Start it first: filekb ui", err=True)
 
 
 # ============================================================================
@@ -279,15 +344,26 @@ def status(skipped: bool):
 @main.command()
 @click.option("--port", default=8501, help="Streamlit port")
 def ui(port: int):
-    """Launch the Streamlit Web UI."""
+    """Launch the Streamlit Web UI + FastAPI backend."""
     import subprocess
+    import time
 
     ui_dir = Path(__file__).parent / "ui"
-    click.echo(f"Starting FileKB UI on http://localhost:{port}")
-    subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(ui_dir / "app.py"),
-         "--server.port", str(port)],
+    click.echo(f"Starting FastAPI backend on http://localhost:9494 ...")
+    server_proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "filekb.server:app",
+         "--host", "127.0.0.1", "--port", "9494"],
     )
+    time.sleep(1.5)
+    click.echo(f"Starting FileKB UI on http://localhost:{port}")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "streamlit", "run", str(ui_dir / "app.py"),
+             "--server.port", str(port)],
+        )
+    finally:
+        server_proc.terminate()
+        server_proc.wait()
 
 
 # ============================================================================
