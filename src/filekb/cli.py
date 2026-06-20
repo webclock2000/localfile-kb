@@ -95,9 +95,13 @@ def _run_full_index_via_api(kb: str) -> None:
             data = resp.json()
             click.echo(
                 f"Index complete. "
-                f"Files processed: {data.get('files_processed', '?')}, "
-                f"Facts added: {data.get('facts_added', '?')}, "
-                f"Skipped: {data.get('files_skipped', 0)}"
+                f"Files: {data.get('files_processed', '?')} processed, "
+                f"{data.get('files_skipped', 0)} skipped, "
+                f"{data.get('files_deleted', 0)} deleted. "
+                f"Facts: {data.get('facts_added', '?')} added. "
+                f"Entities: {data.get('entity_proposals', 0)} proposals, "
+                f"{data.get('entity_merged', 0)} merged, "
+                f"{data.get('entity_suspects', 0)} suspects."
             )
         else:
             click.echo(f"Index failed: {resp.status_code} — {resp.text}", err=True)

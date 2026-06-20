@@ -229,6 +229,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = Field(default=20, ge=1, le=100)
     kb: str = Field(default="默认")
+    session_id: str | None = None   # 传递会话ID以支持多轮对话上下文
 
 
 class AskResponse(BaseModel):
@@ -247,6 +248,16 @@ class IndexRequest(BaseModel):
 class IndexResponse(BaseModel):
     run_id: int
     status: str
+    files_processed: int = 0
+    files_changed: int = 0
+    files_skipped: int = 0
+    files_deleted: int = 0
+    facts_added: int = 0
+    facts_removed: int = 0
+    entity_proposals: int = 0
+    entity_merged: int = 0
+    entity_suspects: int = 0
+    skip_reasons: dict[str, int] = Field(default_factory=dict)
 
 
 class FeedbackRequest(BaseModel):
@@ -315,6 +326,16 @@ def ask_endpoint(req: AskRequest, request: Request):
     gs = _kb_gs(request, kb)
     cfg = request.app.state.config
 
+    # Fetch conversation history for multi-turn context
+    conversation_history: list[dict] | None = None
+    if req.session_id:
+        history = store.get_chat_history(kb, req.session_id)
+        if history:
+            conversation_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in history
+            ]
+
     result = run_query(
         question=req.question, store=store, vector_store=vs, graph_store=gs,
         llm_client=request.app.state.llm_client, vector_top_k=req.top_k,
@@ -324,6 +345,7 @@ def ask_endpoint(req: AskRequest, request: Request):
         max_context_chunks=cfg.query.max_context_chunks,
         max_context_facts=cfg.query.max_context_facts,
         answer_max_tokens=cfg.query.answer_max_tokens,
+        conversation_history=conversation_history,
     )
     return AskResponse(answer=result.answer, sources=result.sources,
                        related_facts=result.related_facts, retrieval_count=result.retrieval_count)
@@ -345,10 +367,21 @@ async def ask_stream_endpoint(req: AskRequest, request: Request):
     gs = _kb_gs(request, kb)
     cfg = request.app.state.config
 
+    # Fetch conversation history for multi-turn context
+    conversation_history: list[dict] | None = None
+    if req.session_id:
+        history = store.get_chat_history(kb, req.session_id)
+        if history:
+            conversation_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in history
+            ]
+
     result = run_query(
         question=req.question, store=store, vector_store=vs, graph_store=gs,
         llm_client=request.app.state.llm_client, vector_top_k=req.top_k,
         answer_max_tokens=cfg.query.answer_max_tokens,
+        conversation_history=conversation_history,
     )
 
     ctx_parts = []
@@ -363,10 +396,12 @@ async def ask_stream_endpoint(req: AskRequest, request: Request):
     except FileNotFoundError:
         sys_prompt = "基于提供的上下文回答问题，为每个声明引用源文件。"
 
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": req.question},
-    ]
+    messages = []
+    if conversation_history:
+        for m in conversation_history:
+            messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "system", "content": sys_prompt})
+    messages.append({"role": "user", "content": req.question})
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
@@ -557,6 +592,7 @@ def _run_index_pipeline(
 
                 # Clean up old facts from previous failed/skipped attempts
                 store.soft_delete_facts_by_file(file_id)
+                store.delete_chunks_by_file(file_id)
 
                 # ── Parse file ──
                 text = parser.parse_file(file_path)
@@ -666,6 +702,7 @@ def _run_index_pipeline(
                 file_record = store.get_file_by_path(deleted_path)
                 if file_record:
                     store.soft_delete_file(file_record["id"])
+                    store.delete_chunks_by_file(file_record["id"])
                     files_changed += 1
                     logger.info("Soft-deleted: %s", deleted_path)
             except Exception as del_err:
@@ -743,6 +780,15 @@ def _run_index_pipeline(
             except Exception as e:
                 logger.exception("Entity QA failed (non-fatal): %s", e)
 
+        # ── 10. DLQ maintenance — prune old entries ──
+        try:
+            pruned = store.prune_dlq(days=cfg.resilience.dlq.prune_days)
+            if pruned > 0:
+                logger.info("DLQ pruned: %d entries older than %d days",
+                           pruned, cfg.resilience.dlq.prune_days)
+        except Exception as e:
+            logger.exception("DLQ pruning failed (non-fatal): %s", e)
+
         return {
             "run_id": run_id,
             "files_processed": total_files,
@@ -805,6 +851,16 @@ def index_endpoint(req: IndexRequest, request: Request):
                f"{result.get('facts_added', 0)} facts"
         if "files_processed" in result
         else result.get("message", result.get("status", "completed")),
+        files_processed=result.get("files_processed", 0),
+        files_changed=result.get("files_changed", 0),
+        files_skipped=result.get("files_skipped", 0),
+        files_deleted=result.get("files_deleted", 0),
+        facts_added=result.get("facts_added", 0),
+        facts_removed=result.get("facts_removed", 0),
+        entity_proposals=result.get("entity_proposals", 0),
+        entity_merged=result.get("entity_merged", 0),
+        entity_suspects=result.get("entity_suspects", 0),
+        skip_reasons=result.get("skip_reasons", {}),
     )
 
 

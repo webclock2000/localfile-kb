@@ -267,7 +267,7 @@ if question:
             try:
                 resp = requests.post(
                     f"{API_BASE}/ask",
-                    json={"question": question, "kb": kb},
+                    json={"question": question, "kb": kb, "session_id": session_id or None},
                     timeout=120,
                 )
                 if resp.status_code == 200:

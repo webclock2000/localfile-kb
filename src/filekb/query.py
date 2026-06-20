@@ -140,6 +140,7 @@ def query(
     max_context_chunks: int = 8,
     max_context_facts: int = 30,
     answer_max_tokens: int = 1024,
+    conversation_history: list[dict] | None = None,
 ) -> QueryResult:
     """Execute a full query pipeline: retrieve → rank → expand → answer.
 
@@ -278,6 +279,7 @@ def query(
         context=context,
         system_prompt=system_prompt,
         max_tokens=answer_max_tokens,
+        conversation_history=conversation_history,
     )
 
     # Step 7: Build result

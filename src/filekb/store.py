@@ -372,10 +372,14 @@ class Store:
         self.conn.commit()
 
     def soft_delete_file(self, file_id: int) -> None:
-        """Mark a file and its facts as deleted (soft delete)."""
+        """Mark a file and its facts as deleted (soft delete).
+
+        Detach facts from chunks so chunk cleanup won't violate FK constraints.
+        """
         self.conn.execute("UPDATE files SET status = 'deleted' WHERE id = ?", (file_id,))
         self.conn.execute(
-            "UPDATE facts SET status = 'deleted' WHERE file_id = ?", (file_id,)
+            "UPDATE facts SET status = 'deleted', chunk_id = NULL WHERE file_id = ?",
+            (file_id,),
         )
         self.conn.commit()
 
@@ -526,13 +530,21 @@ class Store:
         )
 
     def soft_delete_facts_by_file(self, file_id: int) -> None:
+        """Mark facts as deleted and detach from chunks so chunks can be safely
+        hard-deleted without foreign-key violations."""
         self.conn.execute(
-            "UPDATE facts SET status = 'deleted' WHERE file_id = ?", (file_id,)
+            "UPDATE facts SET status = 'deleted', chunk_id = NULL WHERE file_id = ?",
+            (file_id,),
         )
         self.conn.commit()
 
     def delete_chunks_by_file(self, file_id: int) -> int:
-        """Hard-delete all chunks for a file. Returns count deleted."""
+        """Hard-delete all chunks for a file, after detaching any failed_chunks
+        references to avoid foreign-key violations. Returns count deleted."""
+        # Detach failed_chunks FK before deleting chunks
+        self.conn.execute(
+            "UPDATE failed_chunks SET chunk_id = NULL WHERE file_id = ?", (file_id,)
+        )
         cur = self.conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
         self.conn.commit()
         return cur.rowcount
@@ -570,13 +582,24 @@ class Store:
         return cur.rowcount
 
     def search_facts_fts(self, query: str, limit: int = 10) -> list[sqlite3.Row]:
-        """Full-text search via FTS5."""
+        """Full-text search via FTS5.
+
+        Sanitizes the query to remove FTS5 special characters that would
+        cause syntax errors (e.g. '?', '*', quotes, parentheses).
+        """
+        import re
+        # Strip FTS5 special characters: * " ( ) ? ？ and column:term syntax
+        safe = re.sub(r'[*"\'()?？：:]', ' ', query)
+        # Collapse whitespace
+        safe = ' '.join(safe.split())
+        if not safe:
+            return []
         return self.conn.execute(
             "SELECT f.* FROM facts f "
             "JOIN facts_fts fts ON f.id = fts.rowid "
             "WHERE facts_fts MATCH ? AND f.status = 'active' "
             "ORDER BY rank LIMIT ?",
-            (query, limit),
+            (safe, limit),
         ).fetchall()
 
     def get_all_active_fact_ids(self) -> list[int]:
@@ -856,7 +879,7 @@ class Store:
         rows = self.conn.execute(
             """SELECT session_id,
                       MIN(created_at) AS created_at,
-                      COUNT(*)      AS turns
+                      COUNT(*) FILTER (WHERE role = 'user') AS turns
                FROM chat_history
                WHERE kb_name = ?
                GROUP BY session_id

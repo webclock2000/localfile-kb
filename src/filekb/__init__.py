@@ -6,4 +6,4 @@ builds a queryable knowledge graph, and supports natural language
 Q&A with full source provenance.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

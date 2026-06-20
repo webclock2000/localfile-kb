@@ -266,6 +266,7 @@ class LLMClient:
         system_prompt: str,
         max_tokens: int = 1024,
         temperature: float = 0.3,
+        conversation_history: list[dict] | None = None,
     ) -> LLMResponse:
         """Generate a sourced answer from retrieved context.
 
@@ -275,11 +276,15 @@ class LLMClient:
             system_prompt: Answer generation prompt.
             max_tokens: Max output tokens.
             temperature: Sampling temperature.
+            conversation_history: Previous Q&A pairs for multi-turn context.
         """
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
-        ]
+        messages: list[dict] = []
+        # Prepend previous conversation so the LLM can understand follow-up questions
+        if conversation_history:
+            for m in conversation_history:
+                messages.append({"role": m["role"], "content": m["content"]})
+        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"})
         return self.chat(messages, max_tokens=max_tokens, temperature=temperature)
 
     def continue_truncated(

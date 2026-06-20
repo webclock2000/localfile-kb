@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FileKB is a **file-driven, 100% local, zero-cloud personal knowledge base**. It monitors local directories, extracts structured knowledge (entity-relationship triples) via a local LLM, builds a queryable knowledge graph, and supports natural language Q&A with source provenance. Primary target: Apple Silicon Mac (M5 Max + 128GB) running oMLX + Qwen3.6-35B-A3B-MTP.
+FileKB is a **file-driven, 100% local, zero-cloud personal knowledge base**. It monitors local directories, extracts structured knowledge (entity-relationship triples) via a local LLM, builds a queryable knowledge graph, and supports natural language Q&A with source provenance. Primary target: Apple Silicon Mac (M5 Max + 128GB) running oMLX.
 
-**Current status**: Design phase. No code written yet. [`docs/DEVELOPMENT_V3.md`](docs/DEVELOPMENT_V3.md) is the sole authoritative design document — all implementation decisions derive from it.
+**Current status**: v0.1.1. Code-complete, actively used. [`docs/DEVELOPMENT_V3.md`](docs/DEVELOPMENT_V3.md) is the design reference for architecture, ADRs, data model, and prompts — but **code is the source of truth**. Actual deployment differs from the original design in several places (see [docs/README.md](docs/README.md) for the diff table).
 
 ## Project Directory Structure
 
