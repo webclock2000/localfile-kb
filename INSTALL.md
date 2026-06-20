@@ -4,26 +4,23 @@
 
 ## 环境要求
 
-FileKB 本身内存占用很小（~200 MB 含 FAISS + 图谱）。内存需求主要由 LLM 决定。
+FileKB 本身内存占用很小（约 200 MB，含 FAISS 索引和知识图谱）。真正的内存需求来自 LLM 和 embedding 模型。
 
-### 最低配置
+### 最低配置 — 32 GB 内存的 Mac 或 Linux 电脑
 
-| 组件 | 说明 |
-|------|------|
-| **操作系统** | macOS 13+ 或 Linux（Apple Silicon 推荐，OCR 需 macOS Vision） |
-| **内存** | 16 GB — 支持 7B 级 LLM（4-bit ~6 GB）+ embedding + 系统开销 |
-| **磁盘** | 2 GB 空闲 |
-| **Python** | 3.12+ |
-| **LLM 服务** | oMLX / Ollama / llama.cpp / vLLM 等 OpenAI 兼容 API |
+32 GB 可以舒适地运行一个 14B 级别的 LLM（4-bit 约 9 GB）加上 embedding 模型（约 1 GB），还有足够余量跑 OCR、知识图谱索引和日常桌面操作。
 
-### 推荐配置
+- **操作系统**: macOS 13+（Apple Silicon）或 Linux
+- **内存**: 32 GB
+- **磁盘**: 2 GB 空闲
+- **Python**: 3.12+
+- **LLM**: 任意 OpenAI 兼容的本地服务 — oMLX、Ollama、llama.cpp、vLLM
 
-| 组件 | 说明 |
-|------|------|
-| **内存** | 64 GB — 舒适运行 35B 级 LLM（4-bit ~17 GB）+ embedding + OCR |
-| **磁盘** | 10 GB 空闲（留足索引和模型空间） |
+### 推荐配置 — 64 GB 的 Apple Silicon Mac
 
-> 开发者运行于 M5 Max + 128GB，但那是为了在 oMLX 中同时加载多个 35B+ 模型。FileKB 只需一个 LLM + 一个 embedding 模型即可。
+64 GB 可以同时跑 35B 级别的 LLM（4-bit 约 17 GB）、embedding 模型、OCR，全部流畅无压力。
+
+> 开发者使用 M5 Max + 128GB，但那是在 oMLX 中同时加载多个 35B+ 大模型用的。FileKB 单用不需要那么多。
 
 ### 所需运行时
 

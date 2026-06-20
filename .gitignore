@@ -41,5 +41,10 @@ __pycache__/
 
 # Models (downloaded at runtime, not committed)
 models/
+
+# Internal design docs — NOT for public release
+docs/
+CLAUDE.md
+
 tests/e2e_real_dir.py
 .ruff_cache/

@@ -32,26 +32,23 @@ FileKB monitors local directories, auto-extracts structured knowledge as entity-
 
 ## 💻 System Requirements
 
-FileKB itself is lightweight (~200 MB for the full stack). The memory floor is set by your LLM.
+FileKB itself is lightweight (~200 MB). The real memory requirement comes from your LLM and embedding model.
 
-### Minimum
+### Minimum — a 32 GB Mac or Linux machine
 
-| Component | Spec | Notes |
-|-----------|------|-------|
-| **RAM** | 16 GB | Enough for a 7B-class LLM (~6 GB 4-bit) + embedding model + FileKB |
-| **Disk** | 2 GB free | SQLite + FAISS indices + models |
-| **OS** | macOS 13+ or Linux | Apple Silicon recommended for OCR (macOS Vision framework) |
-| **Python** | 3.12+ | |
-| **LLM** | Any OpenAI-compatible local server (oMLX, Ollama, llama.cpp, vLLM) | |
+With 32 GB RAM you can comfortably run a 14B-class LLM (4-bit ~9 GB) plus the embedding model (bge-m3 ~1 GB), with enough headroom for OCR, knowledge graph indexing, and normal desktop use.
 
-### Recommended
+- **OS**: macOS 13+ (Apple Silicon) or Linux
+- **RAM**: 32 GB
+- **Disk**: 2 GB free
+- **Python**: 3.12+
+- **LLM**: Any OpenAI-compatible local server — oMLX, Ollama, llama.cpp, vLLM
 
-| Component | Spec | Notes |
-|-----------|------|-------|
-| **RAM** | 64 GB | Comfortable for 35B-class LLM (~17 GB 4-bit) + embedding + OCR + system overhead |
-| **Disk** | 10 GB free | Room for larger indices and model files |
+### Recommended — a 64 GB Apple Silicon Mac
 
-> **Note**: The developer runs on an M5 Max + 128GB, but that's for running multiple 35B+ models simultaneously in oMLX. FileKB needs only one LLM and one embedding model — 16 GB is the tested minimum.
+With 64 GB you can run a 35B-class LLM (4-bit ~17 GB) alongside the embedding model, OCR, and everything else comfortably — no swapping, no waiting.
+
+> **Note**: The developer uses an M5 Max with 128 GB to run multiple large models in oMLX simultaneously. For FileKB alone, that much is not necessary.
 
 ## 🚀 Quick Start
 
@@ -59,7 +56,7 @@ FileKB itself is lightweight (~200 MB for the full stack). The memory floor is s
 
 - **macOS** (Apple Silicon recommended) or Linux
 - **Python 3.12+**
-- **oMLX** (or any OpenAI-compatible LLM server) running on `http://127.0.0.1:8081/v1`
+- **A local LLM** — oMLX, Ollama, llama.cpp, or any OpenAI-compatible API running on your machine
 
 ### Installation
 
