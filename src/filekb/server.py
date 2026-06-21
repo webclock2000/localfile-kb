@@ -550,17 +550,26 @@ def _finalize_run(
     run_id: int,
     start_ts: float,
 ) -> None:
-    """Finalize an index run: compute embeddings, rebuild indices, update run record.
+    """Finalize an index run: update run record, then compute embeddings & rebuild indices.
 
-    Embeddings and rebuild are NOT gated on ``files_changed`` — historical runs
-    may have crashed before persisting embeddings, and ``_compute_embeddings_for_kb``
-    only touches facts that actually lack an embedding, so calling it always is safe.
+    Run statistics are persisted FIRST (lightweight SQL, near-zero failure rate).
+    Heavy operations (embeddings + FAISS/Graph rebuild) come after so that a crash
+    here doesn't lose the file/fact counts — the next run will auto-catch-up via
+    ``_compute_embeddings_for_kb``.
     """
-    # ── Compute & persist embeddings (always — handles orphan facts from prior crashes) ──
+    # ── 1. Persist run stats FIRST — lightweight, almost never fails ──
+    store.update_run(
+        run_id,
+        files_total=total_files,
+        files_changed=files_changed,
+        facts_added=total_facts,
+    )
+
+    # ── 2. Compute & persist embeddings (catch-up handles orphan facts from prior crashes) ──
     logger.info("Computing embeddings for facts without them...")
     _compute_embeddings_for_kb(store)
 
-    # ── Rebuild search indices (always — rebuilds from whatever embeddings exist) ──
+    # ── 3. Rebuild search indices ──
     logger.info("Rebuilding FAISS index and knowledge graph...")
     vs.rebuild_from_sqlite(store)
     faiss_dir = _kb_faiss_dir(str(Path(cfg.database.path).expanduser().parent), kb_name)
@@ -568,14 +577,6 @@ def _finalize_run(
     _rebuild_graph_for_kb(store, gs)
     logger.info("Indices rebuilt: %d vectors, %d nodes, %d edges",
                 vs.size, gs.node_count, gs.edge_count)
-
-    # ── Finalize run record ──
-    store.update_run(
-        run_id,
-        files_total=total_files,
-        files_changed=files_changed,
-        facts_added=total_facts,
-    )
 
     elapsed = time.time() - start_ts
     logger.info(
@@ -722,8 +723,15 @@ def _run_index_pipeline(
                     total_files += 1
                     total_facts += _facts
                     files_changed += 1
-                _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
-                             total_files, total_facts, files_skipped, run_id, start_ts)
+                try:
+                    _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
+                                 total_files, total_facts, files_skipped, run_id, start_ts)
+                except BaseException:
+                    logger.exception(
+                        "Finalize failed during stop for KB '%s' — "
+                        "run stats already persisted, status kept as cancelled",
+                        kb_name,
+                    )
                 store.finish_run(run_id, "cancelled")
                 return {
                     "run_id": run_id,
