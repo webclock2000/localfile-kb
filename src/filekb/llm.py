@@ -256,7 +256,9 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
             extra_body=extra_body,
-            response_format={"type": "json_object"},
+            # Note: NOT passing response_format={"type": "json_object"} —
+            # oMLX Qwen models break (produce garbage like "[1.1]") when this
+            # is set. The prompt text instructing "纯 JSON" is sufficient.
         )
 
     def generate_answer(
@@ -332,7 +334,6 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=0.3,
             extra_body=extra_body,
-            response_format={"type": "json_object"},
         )
 
     # ------------------------------------------------------------------

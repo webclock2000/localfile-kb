@@ -1,14 +1,6 @@
 # FileKB Streamlit Configuration
-
-[theme]
-# base 不设置 = 跟随系统，用户可通过右上方按钮临时切换
-font = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
-headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,100..900&display=swap, sans-serif"
-codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;1,400&display=swap, monospace"
-baseFontSize = 16
-codeFontSize = "0.875rem"
-headingFontSizes = { h1 = "2rem", h2 = "1.5rem", h3 = "1.25rem" }
-headingFontWeights = { h1 = 700, h2 = 600, h3 = 600 }
+# No [theme] section — let Streamlit follow system light/dark mode.
+# Fonts are set via CSS in app.py.
 
 [server]
 headless = true

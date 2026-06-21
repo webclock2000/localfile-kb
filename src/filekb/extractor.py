@@ -113,9 +113,11 @@ def _incremental_json_parse(text: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(text)
         if isinstance(data, dict) and "facts" in data:
-            return data["facts"]
+            facts = data["facts"]
+            if isinstance(facts, list):
+                return [f for f in facts if isinstance(f, dict)]
         if isinstance(data, list):
-            return data
+            return [f for f in data if isinstance(f, dict)]
     except json.JSONDecodeError:
         pass
 
@@ -147,7 +149,9 @@ def _incremental_json_parse(text: str) -> list[dict[str, Any]]:
     pattern = r'\{"[^"]*":\s*"[^"]*"(?:,\s*"[^"]*":\s*"[^"]*"|\s*,\s*"[^"]*":\s*\d+)*\}'
     for match in re.finditer(pattern, text):
         try:
-            facts.append(json.loads(match.group()))
+            obj = json.loads(match.group())
+            if isinstance(obj, dict):
+                facts.append(obj)
         except json.JSONDecodeError:
             pass
 
@@ -178,7 +182,7 @@ def _extract_one_round(
     )
 
     facts_dicts = _incremental_json_parse(response.content)
-    facts = [Fact.from_dict(d) for d in facts_dicts]
+    facts = [Fact.from_dict(d) for d in facts_dicts if isinstance(d, dict)]
 
     if response.is_truncated and not facts:
         # Try continuation — resend original document + partial response
@@ -189,7 +193,7 @@ def _extract_one_round(
             extra_body={"enable_thinking": False},
         )
         more_dicts = _incremental_json_parse(continuation.content)
-        facts.extend(Fact.from_dict(d) for d in more_dicts)
+        facts.extend(Fact.from_dict(d) for d in more_dicts if isinstance(d, dict))
 
         # If STILL no facts, try once more with explicit force-JSON prompt
         if not facts:
@@ -214,7 +218,7 @@ def _extract_one_round(
                     response_format={"type": "json_object"},
                 )
                 force_dicts = _incremental_json_parse(force_resp.content)
-                facts.extend(Fact.from_dict(d) for d in force_dicts)
+                facts.extend(Fact.from_dict(d) for d in force_dicts if isinstance(d, dict))
             except Exception as e:
                 logger.warning("Force-JSON retry failed: %s", e)
 

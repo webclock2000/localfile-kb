@@ -151,8 +151,9 @@ with tab_ocr:
 # Footer: link to KB management
 # ═══════════════════════════════════════════════
 st.divider()
+kb_mgmt_page = st.Page("views/kb_management.py", title="知识库管理", icon="📚")
 st.page_link(
-    "pages/kb_management.py",
+    kb_mgmt_page,
     label="📚 前往知识库管理 →",
     help="创建、重命名、删除知识库，管理监控目录",
 )

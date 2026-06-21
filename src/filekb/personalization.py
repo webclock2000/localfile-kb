@@ -457,7 +457,7 @@ def generate_suspect_proposals(
         # Check if already proposed for this entity
         existing = store.conn.execute(
             """SELECT id FROM entity_proposals
-               WHERE entity_a = ? AND proposal_type = 'suspect' AND status = 'proposed'""",
+               WHERE entity_a = ? AND proposal_type = 'suspect'""",
             (suspect["entity"],),
         ).fetchone()
         if existing:

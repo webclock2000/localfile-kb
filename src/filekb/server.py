@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -154,6 +155,23 @@ def _remove_kb_state(app: FastAPI, kb_name: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: initialize per-KB stores based on directory groups."""
+    import threading
+
+    # Global exception hook for daemon threads — last-resort catcher
+    # for anything that slips past explicit except blocks.
+    _original_hook = threading.excepthook
+    def _filekb_excepthook(args):
+        logger.critical(
+            "Unhandled exception in threading (daemon thread may have died silently):\n"
+            "  Thread: %s\n  Type: %s\n  Value: %s\n  Traceback:\n%s",
+            args.thread.name if args.thread else "?",
+            args.exc_type.__name__ if args.exc_type else "?",
+            args.exc_value,
+            args.exc_traceback,
+        )
+        # Still call original hook for stderr visibility
+        _original_hook(args)
+    threading.excepthook = _filekb_excepthook
     cfg = load_config()
     app.state.config = cfg
 
@@ -176,6 +194,7 @@ async def lifespan(app: FastAPI):
     app.state.kb_stores: dict[str, Store] = {}
     app.state.kb_vector_stores: dict[str, VectorStore] = {}
     app.state.kb_graph_stores: dict[str, GraphStore] = {}
+    app.state.kb_stop_events: dict[str, Any] = {}  # KB name → threading.Event
 
     for kb_name in app.state.kb_names:
         _init_kb_state(app, kb_name)
@@ -475,6 +494,53 @@ def graph_endpoint(
 # ============================================================================
 
 
+def _finalize_run(
+    store: Store,
+    vs: VectorStore,
+    gs: GraphStore,
+    kb_name: str,
+    cfg: Config,
+    files_changed: int,
+    total_files: int,
+    total_facts: int,
+    files_skipped: int,
+    run_id: int,
+    start_ts: float,
+) -> None:
+    """Finalize an index run: compute embeddings, rebuild indices, update run record.
+
+    Embeddings and rebuild are NOT gated on ``files_changed`` — historical runs
+    may have crashed before persisting embeddings, and ``_compute_embeddings_for_kb``
+    only touches facts that actually lack an embedding, so calling it always is safe.
+    """
+    # ── Compute & persist embeddings (always — handles orphan facts from prior crashes) ──
+    logger.info("Computing embeddings for facts without them...")
+    _compute_embeddings_for_kb(store)
+
+    # ── Rebuild search indices (always — rebuilds from whatever embeddings exist) ──
+    logger.info("Rebuilding FAISS index and knowledge graph...")
+    vs.rebuild_from_sqlite(store)
+    faiss_dir = _kb_faiss_dir(str(Path(cfg.database.path).expanduser().parent), kb_name)
+    vs.save(faiss_dir)
+    _rebuild_graph_for_kb(store, gs)
+    logger.info("Indices rebuilt: %d vectors, %d nodes, %d edges",
+                vs.size, gs.node_count, gs.edge_count)
+
+    # ── Finalize run record ──
+    store.update_run(
+        run_id,
+        files_total=total_files,
+        files_changed=files_changed,
+        facts_added=total_facts,
+    )
+
+    elapsed = time.time() - start_ts
+    logger.info(
+        "Index run %d complete: %d files (%d skipped, %d changed), %d facts, %.1fs",
+        run_id, total_files, files_skipped, files_changed, total_facts, elapsed,
+    )
+
+
 def _run_index_pipeline(
     kb_name: str,
     store: Store,
@@ -483,6 +549,8 @@ def _run_index_pipeline(
     gs: GraphStore,
     cfg: Config,
     dlq_only: bool = False,
+    stop_event: Any = None,  # threading.Event or None
+    processing_file_tracker: dict[str, str] | None = None,  # mutable dict for status tracking
 ) -> dict[str, Any]:
     """Run the full indexing pipeline for a knowledge base.
 
@@ -491,8 +559,22 @@ def _run_index_pipeline(
 
     One file failure does not kill the entire run — errors are logged
     and the file is marked as failed, then processing continues.
+
+    If stop_event is set during the file loop, the pipeline finishes the
+    current file (to avoid a half-processed state), then exits gracefully.
+    Unprocessed files remain in their current status and will be retried
+    on the next run.
+
+    processing_file_tracker is an optional mutable dict; the pipeline
+    writes the basename of the file it is currently processing to
+    tracker["current"] so the status endpoint can display it.
     """
+
+    def _should_stop() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
     run_id = store.start_run()
+    start_ts = time.time()
     total_files = 0
     total_facts = 0
     files_changed = 0
@@ -546,12 +628,12 @@ def _run_index_pipeline(
                 len(changes["deleted"]), len(changes["unchanged"]),
             )
 
-        # ── Also retry previously failed/skipped/pending files ──
+        # ── Also retry previously failed/skipped/pending/processing files ──
         # "pending" files have their SHA256 in the DB (from upsert_file),
         # so detect_changes won't flag them as "new".  We must explicitly
         # re-process them or they'll be stuck forever.
         retry_files: list[str] = []
-        for status in ("failed", "skipped", "pending"):
+        for status in ("failed", "skipped", "pending", "processing"):
             for row in store.get_files_by_status(status):
                 p = row["path"]
                 if Path(p).exists() and any(
@@ -577,8 +659,46 @@ def _run_index_pipeline(
 
         # ── 3. Process added/modified files ──
         for file_path_str in all_files_to_process:
+            # ── Stop check: finish current file, then exit ──
+            if _should_stop():
+                logger.info(
+                    "Stop requested — %d files done, %d facts. "
+                    "Exiting pipeline gracefully.",
+                    total_files, total_facts,
+                )
+                # file_id / file_facts are only defined after a file is
+                # processed in this iteration.  When stop arrives before
+                # the first file, just finalize with zero progress.
+                try:
+                    _fid = file_id      # noqa: F823
+                    _facts = file_facts
+                except NameError:
+                    pass
+                else:
+                    store.mark_file_indexed(_fid)
+                    total_files += 1
+                    total_facts += _facts
+                    files_changed += 1
+                _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
+                             total_files, total_facts, files_skipped, run_id, start_ts)
+                store.finish_run(run_id, "cancelled")
+                return {
+                    "run_id": run_id,
+                    "files_processed": total_files,
+                    "files_changed": files_changed,
+                    "facts_added": total_facts,
+                    "files_deleted": 0,
+                    "files_skipped": files_skipped,
+                    "skip_reasons": skip_reasons,
+                    "status": "cancelled",
+                    "message": "索引已停止 — %d 个文件已处理，剩余将在下次启动时继续。" % total_files,
+                }
+
             try:
                 file_path = Path(file_path_str)
+                # Track current file for status display
+                if processing_file_tracker is not None:
+                    processing_file_tracker[kb_name] = file_path.name
                 file_size = file_path.stat().st_size
 
                 # Skip files > 50MB
@@ -717,12 +837,12 @@ def _run_index_pipeline(
                     file_path.name, file_facts, len(chunks),
                 )
 
-            except Exception as file_err:
+            except BaseException as file_err:
                 logger.error("Failed to process file %s: %s", file_path_str, file_err)
                 try:
                     if 'file_id' in dir():
                         store.update_file_status(file_id, "failed", str(file_err))
-                except Exception:
+                except BaseException:
                     pass
 
         # ── 4. Process deleted files (soft-delete) ──
@@ -737,34 +857,10 @@ def _run_index_pipeline(
             except Exception as del_err:
                 logger.error("Failed to soft-delete %s: %s", deleted_path, del_err)
 
-        # ── 5. Compute & persist embeddings ──
-        if files_changed > 0:
-            logger.info("Computing embeddings for new facts...")
-            _compute_embeddings_for_kb(store)
-
-        # ── 6. Rebuild search indices ──
-        if files_changed > 0:
-            logger.info("Rebuilding FAISS index and knowledge graph...")
-            vs.rebuild_from_sqlite(store)
-            faiss_dir = _kb_faiss_dir(str(Path(cfg.database.path).expanduser().parent), kb_name)
-            vs.save(faiss_dir)
-            _rebuild_graph_for_kb(store, gs)
-            logger.info("Indices rebuilt: %d vectors, %d nodes, %d edges",
-                        vs.size, gs.node_count, gs.edge_count)
-
-        # ── 7. Finalize run ──
-        store.update_run(
-            run_id,
-            files_total=total_files,
-            files_changed=files_changed,
-            facts_added=total_facts,
-        )
+        # ── 5-7. Finalize: embeddings + rebuild + run record ──
+        _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
+                     total_files, total_facts, files_skipped, run_id, start_ts)
         store.finish_run(run_id, "completed")
-
-        logger.info(
-            "Index run %d complete: %d files (%d skipped), %d facts",
-            run_id, total_files, files_skipped, total_facts,
-        )
 
         # ── 8. Entity resolution (if enabled) ──
         entity_proposals = 0
@@ -831,14 +927,19 @@ def _run_index_pipeline(
             "entity_suspects": entity_suspects,
         }
 
-    except Exception:
+    except BaseException:
         logger.exception("Index pipeline crashed for KB '%s'", kb_name)
         try:
-            store.update_run(run_id, files_total=total_files, files_changed=files_changed,
-                           facts_added=total_facts)
+            _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
+                         total_files, total_facts, files_skipped, run_id, start_ts)
             store.finish_run(run_id, "crashed")
-        except Exception:
-            pass
+        except BaseException:
+            try:
+                store.update_run(run_id, files_total=total_files, files_changed=files_changed,
+                               facts_added=total_facts)
+                store.finish_run(run_id, "crashed")
+            except BaseException:
+                pass
         raise
 
 
@@ -857,40 +958,100 @@ def index_endpoint(req: IndexRequest, request: Request):
 
     Set dlq=true to only retry previously failed chunks without scanning
     files again.
+
+    The pipeline now runs in a background thread.  The endpoint returns
+    immediately with the run_id.  Poll /status to track progress.
+    Use POST /index/stop to request cancellation.
     """
+    import threading
+
     kb = _resolve_kb(request, req.kb)
+
+    # Track which file is currently being processed (for status display)
+    # Clear previous tracker for this KB
+    if not hasattr(request.app.state, "processing_files"):
+        request.app.state.processing_files: dict[str, str] = {}
+    request.app.state.processing_files[kb] = ""  # will be updated by pipeline
+
+    # Reject if already running for this KB
+    existing = request.app.state.kb_stop_events.get(kb)
+    if existing is not None:
+        # An Event exists and is NOT set → pipeline still running
+        if isinstance(existing, threading.Event) and not existing.is_set():
+            raise HTTPException(409, f"知识库「{kb}」正在索引中，请等待完成或先停止。")
+        # Event IS set → pipeline is stopping. Clean up the stale event.
+        if isinstance(existing, threading.Event) and existing.is_set():
+            request.app.state.kb_stop_events.pop(kb, None)
+
     store = _kb_store(request, kb)
     vs = _kb_vs(request, kb)
     gs = _kb_gs(request, kb)
     cfg = request.app.state.config
 
-    result = _run_index_pipeline(
-        kb_name=kb,
-        store=store,
-        llm_client=request.app.state.llm_client,
-        vs=vs,
-        gs=gs,
-        cfg=cfg,
-        dlq_only=req.dlq,
-    )
+    stop_event = threading.Event()
+    request.app.state.kb_stop_events[kb] = stop_event
+
+    def _run_in_background():
+        try:
+            _run_index_pipeline(
+                kb_name=kb,
+                store=store,
+                llm_client=request.app.state.llm_client,
+                vs=vs,
+                gs=gs,
+                cfg=cfg,
+                dlq_only=req.dlq,
+                stop_event=stop_event,
+                processing_file_tracker=request.app.state.processing_files,
+            )
+        except BaseException:
+            # BaseException catches SystemExit, KeyboardInterrupt, and all
+            # Exception subclasses — ensures the daemon thread never dies
+            # silently. Also catches C-extension-level errors that bypass
+            # the normal exception hierarchy.
+            logger.exception("Index background thread crashed for KB '%s'", kb)
+            try:
+                store.finish_run(store.get_last_run()["id"], "crashed")
+            except Exception:
+                pass
+        finally:
+            # Clean up: remove stop event so next run can start
+            request.app.state.kb_stop_events.pop(kb, None)
+            if kb in request.app.state.processing_files:
+                request.app.state.processing_files.pop(kb, None)
+
+    t = threading.Thread(target=_run_in_background, daemon=True)
+    t.start()
+
+    # Get the run_id from the just-started run
+    last_run = store.get_last_run()
+    run_id = last_run["id"] if last_run else 0
 
     return IndexResponse(
-        run_id=result["run_id"],
-        status=f"completed: {result.get('files_processed', 0)} files, "
-               f"{result.get('facts_added', 0)} facts"
-        if "files_processed" in result
-        else result.get("message", result.get("status", "completed")),
-        files_processed=result.get("files_processed", 0),
-        files_changed=result.get("files_changed", 0),
-        files_skipped=result.get("files_skipped", 0),
-        files_deleted=result.get("files_deleted", 0),
-        facts_added=result.get("facts_added", 0),
-        facts_removed=result.get("facts_removed", 0),
-        entity_proposals=result.get("entity_proposals", 0),
-        entity_merged=result.get("entity_merged", 0),
-        entity_suspects=result.get("entity_suspects", 0),
-        skip_reasons=result.get("skip_reasons", {}),
+        run_id=run_id,
+        status=f"started: 索引任务已启动，后台执行中。",
     )
+
+
+# ============================================================================
+# POST /index/stop — request cancellation of a running index
+# ============================================================================
+
+
+@app.post("/index/stop")
+def index_stop_endpoint(request: Request, kb: str = Query(default="默认")):
+    """Request the indexing pipeline to stop gracefully.
+
+    The pipeline will finish the current file, then exit.
+    Unprocessed files remain in their current status (pending/processing)
+    and will be retried on the next run.
+    """
+    kb = _resolve_kb(request, kb)
+    stop_event = request.app.state.kb_stop_events.get(kb)
+    if stop_event is None:
+        return {"status": "idle", "message": f"「{kb}」当前没有运行中的索引任务。"}
+    stop_event.set()
+    return {"status": "stopping", "message": f"已请求停止「{kb}」的索引——当前文件处理完毕后将安全退出。"}
 
 
 # ============================================================================
@@ -916,6 +1077,10 @@ def status_endpoint(request: Request, kb: str = Query(default="默认")):
         "graph": {"nodes": gs.node_count, "edges": gs.edge_count},
     }
     last_run = store.get_last_run()
+    processing_files: dict[str, str] = getattr(
+        request.app.state, "processing_files", {}
+    )
+    current_file = processing_files.get(kb, "")
 
     return {
         "kb": kb,
@@ -923,6 +1088,7 @@ def status_endpoint(request: Request, kb: str = Query(default="默认")):
         "files_total": store.get_file_count(),
         "facts_total": store.get_fact_count(),
         "health": health,
+        "current_processing_file": current_file,
         "last_run": (
             {"id": last_run["id"], "status": last_run["status"],
              "files_total": last_run["files_total"], "files_changed": last_run["files_changed"],
@@ -965,11 +1131,16 @@ def files_endpoint(
     search: str | None = Query(default=None, description="Fuzzy match file path"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    zero_facts: bool = Query(default=False, description="Show only files with 0 facts"),
 ):
     """List files in a knowledge base with indexing status and fact counts."""
     kb = _resolve_kb(request, kb)
     store = _kb_store(request, kb)
-    rows, total = store.list_files(status=status, search=search, limit=limit, offset=offset)
+    rows, total = store.list_files(status=status, search=search, limit=limit, offset=offset, zero_facts=zero_facts)
+
+    # Filter out files that no longer exist on disk (cheap os.path.exists check)
+    rows = store.stale_check(rows)
+
     return {
         "kb": kb,
         "total": total,
@@ -1183,7 +1354,11 @@ def entity_proposals_endpoint(
     kb: str = Query(default="默认"),
 ):
     kb = _resolve_kb(request, kb)
-    rows = _kb_store(request, kb).get_pending_proposals(proposal_type=proposal_type)
+    store = _kb_store(request, kb)
+    if status != "proposed":
+        rows = store.get_pending_proposals(proposal_type=proposal_type, status=status)
+    else:
+        rows = store.get_pending_proposals(proposal_type=proposal_type)
     return {
         "proposals": [
             {
@@ -1307,6 +1482,21 @@ def entity_rename_endpoint(req: EntityRenameRequest, request: Request):
     if req.proposal_id is not None:
         store.update_proposal_status(req.proposal_id, "approved")
 
+    # Insert protection record for new name — so it won't be re-flagged
+    if req.new_name != req.entity_name:
+        store.insert_proposal(
+            entity_a=req.new_name.strip(),
+            entity_b="",
+            confidence=1.0,
+            status="approved",
+            proposal_type="suspect",
+            llm_response=json.dumps({
+                "reason": f"用户从「{req.entity_name}」重命名确认",
+                "flags": [],
+                "gibberish_score": 0,
+            }, ensure_ascii=False),
+        )
+
     return {"status": "ok", "facts_updated": updated}
 
 
@@ -1325,16 +1515,24 @@ def entity_delete_endpoint(req: EntityDeleteRequest, request: Request):
 
     # Mark proposal as resolved if given
     if req.proposal_id is not None:
-        store.update_proposal_status(req.proposal_id, "approved")
+        store.update_proposal_status(req.proposal_id, "deleted")
 
     return {"status": "ok", "facts_deleted": deleted}
 
 
 @app.post("/entities/suspects/{proposal_id}/ignore")
 def suspect_ignore_endpoint(proposal_id: int, request: Request, kb: str = Query(default="默认")):
-    """Dismiss a suspect flag without changes — mark proposal as rejected."""
+    """Confirm entity as valid — mark proposal as rejected (meaning: reviewed, no action needed)."""
     kb = _resolve_kb(request, kb)
     _kb_store(request, kb).update_proposal_status(proposal_id, "rejected")
+    return {"status": "ok"}
+
+
+@app.post("/entities/suspects/{proposal_id}/revert")
+def suspect_revert_endpoint(proposal_id: int, request: Request, kb: str = Query(default="默认")):
+    """Revert a previously-resolved suspect proposal back to 'proposed' status for re-review."""
+    kb = _resolve_kb(request, kb)
+    _kb_store(request, kb).update_proposal_status(proposal_id, "proposed")
     return {"status": "ok"}
 
 

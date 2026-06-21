@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import requests
 import streamlit as st
 
@@ -29,12 +31,49 @@ st.set_page_config(
 # Session state initialization
 # ═══════════════════════════════════════════════════════════════════
 
+def _resolve_initial_kb() -> str:
+    """Resolve the initial KB on session start.
+
+    Priority:
+    1. URL query param ``?kb=xxx`` (survives browser refresh)
+    2. ``~/.filekb/last_active_kb``  file (survives restart / new tab)
+    3. ``"默认"`` (first-time user)
+    """
+    # 1) URL query param
+    qp_kb = st.query_params.get("kb")
+    if qp_kb:
+        return qp_kb
+
+    # 2) Persisted last-active file
+    last_kb_path = Path("~/.filekb/last_active_kb").expanduser()
+    try:
+        if last_kb_path.is_file():
+            persisted = last_kb_path.read_text(encoding="utf-8").strip()
+            if persisted:
+                return persisted
+    except Exception:
+        pass
+
+    return "默认"
+
+
+def _persist_active_kb(kb_name: str) -> None:
+    """Write the current KB name so it survives restart / new tab."""
+    last_kb_path = Path("~/.filekb/last_active_kb").expanduser()
+    try:
+        last_kb_path.parent.mkdir(parents=True, exist_ok=True)
+        last_kb_path.write_text(kb_name, encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _init_state():
     """Initialize all cross-page session_state keys once."""
+    initial_kb = _resolve_initial_kb()
     defaults: dict[str, object] = {
-        "global_kb": "默认",
+        "global_kb": initial_kb,
         "pending_kb": None,
-        "_last_kb": "默认",
+        "_last_kb": initial_kb,
         "kb_names": ["默认"],
         "kb_meta": {},
         "kb_stats": {},
@@ -57,14 +96,22 @@ st.html("""
     #MainMenu                   { visibility: hidden !important; }
     [data-testid="stStatusWidget"] { display: none !important; }
 
-    /* ── Typography baseline ── */
-    p, li, label, .stMarkdown, .stCaption { line-height: 1.6; }
+    /* ── Typography: use system native fonts (no Google Fonts fetches) ── */
+    html, body, p, li, label, .stMarkdown, .stCaption, input, textarea, select, button {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+                     "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+                     sans-serif;
+        line-height: 1.6;
+    }
 
     /* ── Heading rhythm ── */
     h1, h2, h3 { letter-spacing: -0.02em; text-wrap: balance; }
 
     /* ── Code blocks: ligatures on ── */
-    code, .stCodeBlock code { font-feature-settings: "liga" 1, "calt" 1; }
+    code, .stCodeBlock code {
+        font-family: "SF Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+        font-feature-settings: "liga" 1, "calt" 1;
+    }
 
     /* ── Metric numbers: tabular alignment ── */
     [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
@@ -162,13 +209,13 @@ if _sb_stale or not st.session_state.kb_stats or st.session_state.kb_stats.get("
 # Define pages
 # ═══════════════════════════════════════════════════════════════════
 
-chat_page = st.Page("pages/chat.py", title="对话问答", icon="💬", default=True)
-graph_page = st.Page("pages/graph.py", title="知识图谱", icon="🔗")
-files_page = st.Page("pages/files.py", title="文件管理", icon="📁")
-entity_page = st.Page("pages/entity_review.py", title="实体审核", icon="🔍")
-kb_mgmt_page = st.Page("pages/kb_management.py", title="知识库管理", icon="📚")
-settings_page = st.Page("pages/settings.py", title="系统设置", icon="⚙️")
-status_page = st.Page("pages/status.py", title="系统状态", icon="📊")
+chat_page = st.Page("views/chat.py", title="对话问答", icon="💬", default=True)
+graph_page = st.Page("views/graph.py", title="知识图谱", icon="🔗")
+files_page = st.Page("views/files.py", title="文件管理", icon="📁")
+entity_page = st.Page("views/entity_review.py", title="实体审核", icon="🔍")
+kb_mgmt_page = st.Page("views/kb_management.py", title="知识库管理", icon="📚")
+settings_page = st.Page("views/settings.py", title="系统设置", icon="⚙️")
+status_page = st.Page("views/status.py", title="系统状态", icon="📊")
 
 # ═══════════════════════════════════════════════════════════════════
 # Global sidebar
@@ -205,6 +252,8 @@ with st.sidebar:
                 st.session_state.global_kb = pending
                 st.session_state.messages = []  # clear chat
                 st.session_state.pending_kb = None
+                _persist_active_kb(pending)
+                st.query_params["kb"] = pending
                 _load_kb_stats(pending)
                 st.rerun()
         with c2:

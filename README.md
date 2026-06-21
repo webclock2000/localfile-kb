@@ -6,8 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://pypi.org/project/filekb"><img src="https://img.shields.io/pypi/v/filekb" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/filekb"><img src="https://img.shields.io/pypi/pyversions/filekb" alt="Python versions"></a>
+  <a href="https://github.com/webclock2000/localfile-kb"><img src="https://img.shields.io/badge/python-3.12+-blue" alt="Python versions"></a>
 </p>
 
 ---
@@ -65,8 +64,8 @@ With 64 GB you can run a 35B-class LLM (4-bit ~17 GB) alongside the embedding mo
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 2. Install FileKB from PyPI
-pip install filekb
+# 2. Install FileKB from GitHub
+pip install git+https://github.com/webclock2000/localfile-kb.git
 
 # 3. Create your config
 mkdir -p ~/.filekb

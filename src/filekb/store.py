@@ -320,13 +320,15 @@ class Store:
         search: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        zero_facts: bool = False,
     ) -> tuple[list[sqlite3.Row], int]:
         """List files with fact counts, optional status filter and path search.
 
         Returns (rows, total_count).
         """
-        where: list[str] = []
+        where: list[str] = ["f.status != 'deleted'"]
         params: list[Any] = []
+        having: list[str] = []
 
         if status:
             where.append("f.status = ?")
@@ -334,9 +336,22 @@ class Store:
         if search:
             where.append("f.path LIKE ?")
             params.append(f"%{search}%")
+        if zero_facts:
+            having.append("fact_count = 0")
 
         where_clause = f"WHERE {' AND '.join(where)}" if where else ""
-        count_sql = f"SELECT COUNT(*) FROM files f {where_clause}"
+        having_clause = f"HAVING {' AND '.join(having)}" if having else ""
+
+        count_sql = f"""
+            SELECT COUNT(*) FROM (
+                SELECT f.id, COUNT(DISTINCT fa.id) AS fact_count
+                FROM files f
+                LEFT JOIN facts fa ON fa.file_id = f.id AND fa.status = 'active'
+                {where_clause}
+                GROUP BY f.id
+                {having_clause}
+            )
+        """
         total = self.conn.execute(count_sql, params).fetchone()[0]
 
         query_sql = f"""
@@ -349,6 +364,7 @@ class Store:
             LEFT JOIN facts fa ON fa.file_id = f.id AND fa.status = 'active'
             {where_clause}
             GROUP BY f.id
+            {having_clause}
             ORDER BY f.indexed_at DESC, f.created_at DESC
             LIMIT ? OFFSET ?
         """
@@ -382,6 +398,23 @@ class Store:
             (file_id,),
         )
         self.conn.commit()
+
+    def stale_check(self, file_records: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        """Check file existence on disk; soft-delete missing ones.
+
+        Returns only the records whose paths still exist.  This is a cheap
+        ``os.path.exists()`` check — ~30 syscalls per page, not a SHA256 scan.
+        """
+        import os
+
+        existing: list[sqlite3.Row] = []
+        for r in file_records:
+            if os.path.exists(r["path"]):
+                existing.append(r)
+            else:
+                self.soft_delete_file(r["id"])
+                logger.info("Stale file soft-deleted: %s", r["path"])
+        return existing
 
     def get_file_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -679,14 +712,28 @@ class Store:
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     def get_pending_proposals(
-        self, proposal_type: str | None = None
+        self, proposal_type: str | None = None, status: str | None = None
     ) -> list[sqlite3.Row]:
+        if status and proposal_type:
+            return self.conn.execute(
+                """SELECT * FROM entity_proposals
+                   WHERE status = ? AND proposal_type = ?
+                   ORDER BY confidence DESC""",
+                (status, proposal_type),
+            ).fetchall()
         if proposal_type:
             return self.conn.execute(
                 """SELECT * FROM entity_proposals
                    WHERE status = 'proposed' AND proposal_type = ?
                    ORDER BY confidence DESC""",
                 (proposal_type,),
+            ).fetchall()
+        if status:
+            return self.conn.execute(
+                """SELECT * FROM entity_proposals
+                   WHERE status = ?
+                   ORDER BY confidence DESC""",
+                (status,),
             ).fetchall()
         return self.conn.execute(
             "SELECT * FROM entity_proposals WHERE status = 'proposed' ORDER BY confidence DESC"

@@ -57,15 +57,15 @@ source .venv/bin/activate
 ### 3. 安装 FileKB
 
 ```bash
-# 从 PyPI 安装（推荐）
-pip install filekb
+# 从 GitHub 安装（推荐）
+pip install git+https://github.com/webclock2000/localfile-kb.git
 
 # 安装中文实体校验支持（可选）
-pip install "filekb[deepke]"
+pip install "filekb[deepke] @ git+https://github.com/webclock2000/localfile-kb.git"
 
 # 或者从源码安装（开发模式）
-git clone https://github.com/filekb-org/filekb.git
-cd filekb
+git clone https://github.com/webclock2000/localfile-kb.git
+cd localfile-kb
 pip install -e ".[dev]"
 ```
 

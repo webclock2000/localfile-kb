@@ -44,7 +44,7 @@ dependencies = [
     "sentence-transformers>=3.0",
     "faiss-cpu>=1.8",
     "networkx>=3.3",
-    "markitdown>=0.0.1a3",
+    "markitdown[all]>=0.0.2",
     "pymupdf>=1.24",
     "jieba>=0.42",
     "numpy>=1.26",
@@ -69,7 +69,7 @@ apple-silicon = [
 filekb = "filekb.cli:main"
 
 [project.urls]
-Repository = "https://github.com/filekb-org/filekb"
+Repository = "https://github.com/webclock2000/localfile-kb"
 
 [tool.ruff]
 line-length = 100

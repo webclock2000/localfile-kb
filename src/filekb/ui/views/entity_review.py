@@ -107,7 +107,8 @@ with tab_suspect:
     st.subheader("⚠️ 可疑实体检测")
     st.caption(
         "自动检测疑似 OCR 错误、乱码、无意义实体。"
-        "可以对每个可疑实体进行重命名、删除或忽略。"
+        "可对每个可疑实体进行重命名、删除或确认有效。"
+        "已处理的实体可在「修改历史」中查看和撤销。"
     )
 
     # ── Scan button ──
@@ -197,14 +198,14 @@ with tab_suspect:
                             ):
                                 st.session_state[f"deleting_{prop['id']}"] = True
                         with c3:
-                            if st.button("🚫 忽略", key=f"ign_{prop['id']}"):
+                            if st.button("✓ 确认为实体", key=f"ign_{prop['id']}"):
                                 try:
                                     requests.post(
                                         f"{API_BASE}/entities/suspects/{prop['id']}/ignore",
                                         params={"kb": kb},
                                         timeout=10,
                                     )
-                                    st.success("已忽略。")
+                                    st.success("已确认为有效实体，不再审核。")
                                     st.rerun()
                                 except Exception as e:
                                     st.error(str(e))
@@ -281,9 +282,120 @@ with tab_suspect:
 
                     st.divider()
 
+            # ── Modification history ──
+            st.divider()
+            show_history = st.toggle(
+                "📋 显示已处理",
+                key="show_suspect_history",
+                help="显示已重命名、已确认或已删除的可疑实体记录，可以撤销操作。",
+            )
+
+            if show_history:
+                try:
+                    hist_resp = requests.get(
+                        f"{API_BASE}/entities/proposals",
+                        params={"status": "approved", "proposal_type": "suspect", "kb": kb},
+                        timeout=10,
+                    )
+                    rej_resp = requests.get(
+                        f"{API_BASE}/entities/proposals",
+                        params={"status": "rejected", "proposal_type": "suspect", "kb": kb},
+                        timeout=10,
+                    )
+                    del_resp = requests.get(
+                        f"{API_BASE}/entities/proposals",
+                        params={"status": "deleted", "proposal_type": "suspect", "kb": kb},
+                        timeout=10,
+                    )
+                    all_history: list[dict] = []
+                    if hist_resp.status_code == 200:
+                        all_history.extend(hist_resp.json().get("proposals", []))
+                    if rej_resp.status_code == 200:
+                        all_history.extend(rej_resp.json().get("proposals", []))
+                    if del_resp.status_code == 200:
+                        all_history.extend(del_resp.json().get("proposals", []))
+
+                    if not all_history:
+                        st.caption("暂无已处理的记录。")
+                    else:
+                        all_history.sort(
+                            key=lambda h: h.get("created_at", ""), reverse=True
+                        )
+                        st.caption(f"共 {len(all_history)} 条已处理记录")
+
+                        status_labels = {
+                            "approved": ("✅ 已重命名", "green"),
+                            "deleted": ("🗑️ 已删除", "red"),
+                            "rejected": ("✓ 已确认", "gray"),
+                        }
+
+                        for h in all_history:
+                            detail: dict = {}
+                            if h.get("llm_response"):
+                                try:
+                                    detail = json.loads(h["llm_response"])
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+
+                            h_reason = detail.get("reason", "")
+
+                            # Determine actual status: if approved but entity has
+                            # no facts (deleted), show as "deleted".  Older records
+                            # all used "approved" for both rename and delete.
+                            h_status = h["status"]
+                            if h_status == "approved":
+                                try:
+                                    f_resp = requests.get(
+                                        f"{API_BASE}/facts",
+                                        params={"entity": h["entity_a"], "limit": 1, "kb": kb},
+                                        timeout=5,
+                                    )
+                                    if f_resp.status_code == 200:
+                                        f_count = len(f_resp.json().get("facts", []))
+                                        if f_count == 0:
+                                            h_status = "deleted"
+                                except Exception:
+                                    pass
+
+                            h_status_label, h_color = status_labels.get(
+                                h_status, (h_status, "gray")
+                            )
+
+                            with st.container(border=True):
+                                hc1, hc2 = st.columns([4, 1])
+                                with hc1:
+                                    st.markdown(
+                                        f"**`{h['entity_a']}`** → "
+                                        f"<span style='color:{h_color}'>{h_status_label}</span>",
+                                        unsafe_allow_html=True,
+                                    )
+                                    if h_reason:
+                                        st.caption(h_reason)
+                                with hc2:
+                                    if st.button(
+                                        "↩ 撤销",
+                                        key=f"revert_{h['id']}",
+                                        use_container_width=True,
+                                        help="将此实体恢复到待审核列表",
+                                    ):
+                                        try:
+                                            requests.post(
+                                                f"{API_BASE}/entities/suspects/{h['id']}/revert",
+                                                params={"kb": kb},
+                                                timeout=10,
+                                            )
+                                            st.success("已撤销，实体回到待审核列表。")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(str(e))
+                except requests.exceptions.ConnectionError:
+                    st.error("无法连接到 FileKB 后端服务。")
+                except Exception as e:
+                    st.error(f"出错了: {e}")
+
         else:
             st.error(f"API 错误: {resp.status_code}")
     except requests.exceptions.ConnectionError:
-        st.error("无法连接到 FileKB 后端服务。请先启动服务。")
+        st.error("无法连接到 FileKB 后端服务。")
     except Exception as e:
         st.error(f"出错了: {e}")

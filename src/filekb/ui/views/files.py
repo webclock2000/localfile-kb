@@ -46,6 +46,42 @@ def _format_time(ts: str | None) -> str:
     return ts.replace("T", " ")[:19]
 
 
+@st.fragment(run_every=30)
+def _stop_waiting_fragment(kb_name: str):
+    """Auto-refresh fragment: poll /status until backend finishes stopping."""
+    if not st.session_state.get("idx_stopping", False):
+        return  # stop already resolved, nothing to do
+
+    try:
+        poll = requests.get(f"{API_BASE}/status?kb={kb_name}", timeout=10)
+        if poll.status_code == 200:
+            last_run = poll.json().get("last_run") or {}
+            if last_run.get("status") in ("cancelled", "completed"):
+                st.toast(
+                    f"✅ 索引已安全停止：处理了 {last_run.get('files_changed', 0)} 个文件，"
+                    f"新增 {last_run.get('facts_added', 0)} 条事实。",
+                    icon="✅",
+                )
+                st.session_state.idx_stopping = False
+                st.rerun()
+            cf = poll.json().get("current_processing_file", "")
+        else:
+            cf = ""
+    except Exception:
+        cf = ""
+
+    if cf:
+        st.info(
+            f"⏳ 正在等待当前文件处理完毕：「**{cf}**」"
+            "——完成后将安全停止。每 30 秒自动刷新。"
+        )
+    else:
+        st.info(
+            "⏳ 正在等待当前文件处理完毕，完成后将安全停止。"
+            "每 30 秒自动刷新，请耐心等待。"
+        )
+
+
 kb: str = st.session_state.get("global_kb", "默认")
 
 st.title("📁 文件管理")
@@ -68,15 +104,26 @@ try:
         with sc4:
             st.metric("向量数", health.get("faiss", {}).get("vectors", 0))
 
-        # ── Last run (simplified, no ❓) ──
+        # ── Last run status ──
         last = data.get("last_run")
+        is_running = bool(last and last.get("status") == "running")
         if last and last.get("status") == "completed":
             st.caption(
                 f"上次索引完成：处理 {last.get('files_changed', 0)} 个文件，"
                 f"新增 {last.get('facts_added', 0)} 条事实"
             )
-        elif last and last.get("status") == "running":
-            st.caption("🔄 索引正在运行中…")
+        elif last and last.get("status") == "cancelled":
+            st.success(
+                f"✅ 索引已安全停止：处理了 {last.get('files_changed', 0)} 个文件，"
+                f"新增 {last.get('facts_added', 0)} 条事实。剩余文件将在下次索引时继续。"
+            )
+            st.session_state.idx_stopping = False
+        elif is_running:
+            current_file = data.get("current_processing_file", "")
+            if current_file:
+                st.caption(f"🔄 正在处理: **{current_file}** …")
+            else:
+                st.caption("🔄 索引正在运行中…")
         elif last and last.get("status") == "crashed":
             st.caption(f"上次索引异常退出，处理了 {last.get('files_changed', 0)} 个文件")
 
@@ -84,43 +131,68 @@ try:
         # Check if KB has any directories configured
         try:
             settings_resp = requests.get(f"{API_BASE}/settings", timeout=5)
-            cfg = settings_resp.json() if settings_resp.status_code == 200 else {}
+            cfg_data = settings_resp.json() if settings_resp.status_code == 200 else {}
         except Exception:
-            cfg = {}
+            cfg_data = {}
         dirs_for_kb = [
-            d for d in cfg.get("directories", [])
+            d for d in cfg_data.get("directories", [])
             if d["group"] == kb
         ]
 
         idx_disabled = len(dirs_for_kb) == 0
-        idx_help = (
-            "扫描「{0}」的所有监控目录，检测文件变更（新增/修改/删除），"
-            "解析文件内容并通过 LLM 提取实体和关系，更新向量索引和知识图谱。"
-            "已索引且未变化的文件会被跳过。索引大量文件可能需要较长时间。".format(kb)
-        )
 
         if idx_disabled:
             st.warning("⚠️ 该知识库尚未配置监控目录，请先在「设置」中添加。")
 
-        if st.button(
-            f"🔄 索引「{kb}」知识库",
-            use_container_width=True,
-            type="primary",
-            disabled=idx_disabled,
-            help=idx_help if not idx_disabled else "知识库没有监控目录，无法索引。请先在设置中添加目录。",
-        ):
-            with st.spinner(f"正在索引「{kb}」..."):
+        # ── Waiting for stop (auto-refresh fragment every 30s) ──
+        is_stopping = st.session_state.get("idx_stopping", False)
+        if is_stopping:
+            _stop_waiting_fragment(kb)
+        elif is_running:
+            # Index is running — show STOP button
+            if st.button(
+                "⏹ 停止索引",
+                use_container_width=True,
+                type="secondary",
+                help="停止索引（当前正在处理的文件会完成后才停止，其余文件将在下次索引时继续）。",
+            ):
+                try:
+                    stop_resp = requests.post(
+                        f"{API_BASE}/index/stop", params={"kb": kb}, timeout=10
+                    )
+                    if stop_resp.status_code == 200:
+                        st.info("⏳ 已请求停止 — 等待当前文件处理完毕后将安全退出，请耐心等待。")
+                        st.session_state.idx_stopping = True
+                    else:
+                        st.error(f"停止失败: {stop_resp.status_code}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"错误: {e}")
+        else:
+            # Index is NOT running — show START button
+            idx_help = (
+                "扫描「{0}」的所有监控目录，检测文件变更（新增/修改/删除），"
+                "解析文件内容并通过 LLM 提取实体和关系，更新向量索引和知识图谱。"
+                "已索引且未变化的文件会被跳过。索引大量文件可能需要较长时间。".format(kb)
+            )
+            if st.button(
+                f"🔄 索引「{kb}」知识库",
+                use_container_width=True,
+                type="primary",
+                disabled=idx_disabled,
+                help=idx_help if not idx_disabled else "知识库没有监控目录，无法索引。请先在设置中添加目录。",
+            ):
                 try:
                     resp2 = requests.post(
-                        f"{API_BASE}/index", json={"kb": kb}, timeout=600
+                        f"{API_BASE}/index", json={"kb": kb}, timeout=10
                     )
                     if resp2.status_code == 200:
-                        st.success(f"「{kb}」索引完成")
+                        st.success("索引任务已提交，后台执行中。")
                         st.rerun()
+                    elif resp2.status_code == 409:
+                        st.warning("该知识库正在索引中，请稍候。")
                     else:
                         st.error(f"启动失败: {resp2.status_code}")
-                except requests.exceptions.Timeout:
-                    st.warning("索引任务已提交（等待超时），索引在后台继续运行。")
                 except Exception as e:
                     st.error(f"错误: {e}")
 
@@ -141,7 +213,7 @@ try:
         with fc2:
             status_filter = st.selectbox(
                 "状态筛选",
-                options=["全部", "✅ 已索引", "❌ 失败", "⏭️ 跳过", "⏳ 待处理", "🔄 处理中"],
+                options=["全部", "✅ 已索引", "❌ 失败", "⏭️ 跳过", "⏳ 待处理", "🔄 处理中", "0️⃣ 0 事实"],
                 index=0,
                 label_visibility="collapsed",
                 key="file_status",
@@ -154,9 +226,11 @@ try:
             "⏭️ 跳过": "skipped",
             "⏳ 待处理": "pending",
             "🔄 处理中": "processing",
+            "0️⃣ 0 事实": "zero_facts",
         }
         api_status = status_map[status_filter]
         api_search = search_query.strip() if search_query.strip() else None
+        zero_facts_only = api_status == "zero_facts"
 
         # Pagination state
         if "file_page" not in st.session_state:
@@ -172,7 +246,9 @@ try:
 
         try:
             params: dict = {"kb": kb, "limit": page_size, "offset": offset_val}
-            if api_status:
+            if api_status == "zero_facts":
+                params["zero_facts"] = "true"
+            elif api_status:
                 params["status"] = api_status
             if api_search:
                 params["search"] = api_search
