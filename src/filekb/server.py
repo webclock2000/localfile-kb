@@ -71,6 +71,45 @@ def _collect_kb_groups(cfg: Config) -> dict[str, list[dict]]:
     return groups
 
 
+def _repair_stale_runs(store: Store) -> None:
+    """Mark any runs left in 'running' status as crashed.
+
+    Daemon-thread crashes leave runs stuck at 'running' forever,
+    which blocks new index requests (409 conflict)."""
+    try:
+        rows = store.conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE status = 'running' AND finished_at IS NULL"
+        ).fetchone()[0]
+        if rows:
+            store.conn.execute(
+                "UPDATE runs SET status = 'crashed', finished_at = datetime('now') "
+                "WHERE status = 'running' AND finished_at IS NULL"
+            )
+            store.conn.commit()
+            logger.info("Repaired %d stale running run(s)", rows)
+    except Exception:
+        pass
+
+
+def _repair_stale_files(store: Store) -> None:
+    """Reset files stuck in 'processing' back to 'pending'.
+
+    If the daemon thread died mid-file, the file stays 'processing'
+    forever and is skipped on subsequent runs."""
+    try:
+        rows = store.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE status = 'processing'"
+        ).fetchone()[0]
+        if rows:
+            store.conn.execute(
+                "UPDATE files SET status = 'pending' WHERE status = 'processing'"
+            )
+            store.conn.commit()
+            logger.info("Reset %d processing file(s) back to pending", rows)
+    except Exception:
+        pass
+
+
 def _init_kb_state(app: FastAPI, kb_name: str) -> None:
     """Create per-KB Store / VectorStore / GraphStore for *kb_name* if missing."""
     if kb_name in app.state.kb_stores:
@@ -82,6 +121,10 @@ def _init_kb_state(app: FastAPI, kb_name: str) -> None:
     faiss_dir = _kb_faiss_dir(db_base, kb_name)
 
     store = Store(db_path)
+
+    # Clean up stale state from prior daemon-thread crashes
+    _repair_stale_runs(store)
+    _repair_stale_files(store)
     vs = VectorStore(dimension=1024)
     if not vs.load(faiss_dir):
         # Backfill: compute embeddings if facts exist but FAISS is empty
