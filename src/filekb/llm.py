@@ -341,12 +341,25 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     def health_check(self) -> dict[str, Any]:
-        """Check if the LLM server is reachable."""
+        """Check if the LLM server is reachable.
+
+        Results are cached for 15 seconds to avoid hammering the LLM
+        server with GET /models calls on every status poll from the UI.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if (
+            hasattr(self, "_health_cache")
+            and now - self._health_cache_ts < 15
+        ):
+            return self._health_cache
         try:
             response = self._client.get("/models")
-            return {"status": "ok", "models": response.json()}
+            self._health_cache = {"status": "ok", "models": response.json()}
         except Exception as e:
-            return {"status": "unreachable", "error": str(e)}
+            self._health_cache = {"status": "unreachable", "error": str(e)}
+        self._health_cache_ts = now
+        return self._health_cache
 
     def close(self) -> None:
         self._client.close()

@@ -75,34 +75,45 @@ def parse_file(file_path: str | Path) -> str:
         try:
             return _parse_pdf(path)  # Per-page extraction + OCR inside
         except ValueError as e:
+            # Encrypted PDF or other hard failure — raise with clear message
+            error_msg = str(e)
+            logger.warning("PDF parse hard failure: %s — %s", path.name, error_msg)
+            raise ValueError(error_msg) from e
+        except Exception as e:
             logger.debug("PDF text extraction failed: %s — %s", path.name, e)
         # All methods failed — try full-page OCR as last resort
         return _ocr_fallback(path, "")
     elif suffix in OFFICE_EXTENSIONS:
         try:
             text = _parse_office(path)
-        except ValueError as e:
+        except Exception as e:
             logger.debug("Office parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
         return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in LEGACY_OFFICE_EXTENSIONS:
         try:
             text = _parse_legacy_office(path)
-        except ValueError as e:
+        except Exception as e:
             logger.debug("Legacy office parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
         return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in LEGACY_XLS:
         try:
             text = _parse_office(path)
-        except ValueError as e:
+        except Exception as e:
             logger.debug("XLS parse failed (will try OCR): %s — %s", path.name, e)
             text = ""
+        # If markitdown failed, try LibreOffice → PDF → pymupdf/OCR (like .doc/.ppt)
+        if not text or not text.strip():
+            try:
+                text = _parse_legacy_office(path)
+            except Exception as e2:
+                logger.debug("Legacy office fallback also failed for XLS: %s — %s", path.name, e2)
         return _ocr_fallback(path, text) if _should_ocr(text, path) else text
     elif suffix in IMAGE_EXTENSIONS:
         try:
             return _parse_image(path)
-        except ValueError as e:
+        except Exception as e:
             logger.debug("Image parse failed (will try OCR fallback): %s — %s", path.name, e)
             return _ocr_fallback(path, "")
     elif suffix in CODE_EXTENSIONS:
@@ -158,6 +169,10 @@ def _parse_pdf(path: Path) -> str:
         import fitz
 
         doc = fitz.open(str(path))
+        # Check if the document is encrypted / password-protected
+        if doc.is_encrypted:
+            doc.close()
+            raise ValueError("PDF已加密（需要密码才能打开）")
         page_count = doc.page_count
         page_texts: list[str] = []
 
@@ -191,6 +206,9 @@ def _parse_pdf(path: Path) -> str:
             logger.debug("PDF parsed via pymupdf+OCR: %s (%d pages → %d chars)",
                        path.name, page_count, len(text))
             return text
+    except ValueError:
+        # Re-raise ValueError (e.g., encrypted PDF) so the caller can show a clear message
+        raise
     except Exception as e:
         logger.debug("pymupdf PDF failed for %s: %s", path.name, e)
 
@@ -204,7 +222,11 @@ def _parse_pdf(path: Path) -> str:
         if text and len(text.strip()) > 50:
             logger.debug("PDF parsed via markitdown: %s", path.name)
             return text
-    except Exception as e:
+    except BaseException as e:
+        # Never swallow system exceptions
+        if isinstance(e, (SystemExit, KeyboardInterrupt, GeneratorExit)):
+            raise
+        # markitdown raises FileConversionException(BaseException) on failure
         logger.debug("markitdown PDF failed for %s: %s", path.name, e)
 
     # ── 3. All text extraction failed, defer to full-page OCR ──
@@ -218,16 +240,30 @@ def _parse_pdf(path: Path) -> str:
 
 
 def _parse_office(path: Path) -> str:
-    """Parse .docx/.xlsx/.pptx/.html via markitdown."""
+    """Parse .docx/.xlsx/.pptx/.html/.xls via markitdown.
+
+    Note: markitdown may raise ``FileConversionException(BaseException)`` which
+    is NOT a subclass of ``Exception``. The broad ``except BaseException`` here
+    is intentional — it re-raises system exceptions (SystemExit, KeyboardInterrupt,
+    GeneratorExit) and treats everything else as a parse failure.
+    """
     from markitdown import MarkItDown
 
-    md = MarkItDown()
-    result = md.convert(str(path))
-    text = result.text_content
-    if not text or len(text.strip()) < 10:
-        logger.debug("markitdown empty/near-empty for %s — will try OCR", path.name)
-        return ""  # Return empty so _ocr_fallback can try OCR
-    return text
+    try:
+        md = MarkItDown()
+        result = md.convert(str(path))
+        text = result.text_content
+        if not text or len(text.strip()) < 10:
+            logger.debug("markitdown empty/near-empty for %s — will try OCR", path.name)
+            return ""  # Return empty so _ocr_fallback can try OCR
+        return text
+    except BaseException as e:
+        # Never swallow system exceptions
+        if isinstance(e, (SystemExit, KeyboardInterrupt, GeneratorExit)):
+            raise
+        # markitdown FileConversionException(BaseException) or puremagic PureError(Exception)
+        logger.debug("markitdown conversion failed for %s: %s", path.name, e)
+        return ""
 
 
 # ------------------------------------------------------------------

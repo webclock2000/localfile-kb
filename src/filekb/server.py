@@ -92,11 +92,15 @@ def _repair_stale_runs(store: Store) -> None:
 
 
 def _repair_stale_files(store: Store) -> None:
-    """Reset files stuck in 'processing' back to 'pending'.
+    """Reset files stuck in 'processing' back to 'pending', and retry
+    files that previously failed with markitdown conversion errors.
 
     If the daemon thread died mid-file, the file stays 'processing'
-    forever and is skipped on subsequent runs."""
+    forever and is skipped on subsequent runs.  Additionally, files that
+    failed due to the markitdown ``FileConversionException`` bug (fixed in
+    parser.py) are reset so they get a second chance."""
     try:
+        # Reset stuck processing files
         rows = store.conn.execute(
             "SELECT COUNT(*) FROM files WHERE status = 'processing'"
         ).fetchone()[0]
@@ -108,6 +112,32 @@ def _repair_stale_files(store: Store) -> None:
             logger.info("Reset %d processing file(s) back to pending", rows)
     except Exception:
         pass
+
+    # Also reset files that failed/skipped due to transient errors
+    # (server restart during indexing, markitdown bugs, missing OCR deps, etc.)
+    # These are not file-specific problems — retrying will succeed.
+    _transient_repairs = [
+        # (status, error_pattern, description)
+        ('failed', '%Cannot operate on a closed database%', 'server restart mid-index'),
+        ('failed', '%Could not convert%Markdown%', 'markitdown conversion bug'),
+        ('skipped', '%文件为空或无法解析%', 'empty parse (possible OCR/env issue)'),
+    ]
+    for status, pattern, desc in _transient_repairs:
+        try:
+            rows = store.conn.execute(
+                f"SELECT COUNT(*) FROM files WHERE status = ? "
+                "AND error_msg LIKE ?", (status, pattern)
+            ).fetchone()[0]
+            if rows:
+                store.conn.execute(
+                    f"UPDATE files SET status = 'pending', error_msg = NULL "
+                    "WHERE status = ? AND error_msg LIKE ?", (status, pattern)
+                )
+                store.conn.commit()
+                logger.info("Reset %d transient-%s file(s) for auto-retry (%s)",
+                           rows, status, desc)
+        except Exception:
+            pass
 
 
 def _init_kb_state(app: FastAPI, kb_name: str) -> None:
@@ -795,7 +825,16 @@ def _run_index_pipeline(
                 store.delete_chunks_by_file(file_id)
 
                 # ── Parse file ──
-                text = parser.parse_file(file_path)
+                try:
+                    text = parser.parse_file(file_path)
+                except ValueError as parse_err:
+                    # Encrypted PDF, unsupported format with clear message
+                    error_msg = str(parse_err)
+                    store.update_file_status(file_id, "skipped", error_msg)
+                    files_skipped += 1
+                    skip_reasons[error_msg] = skip_reasons.get(error_msg, 0) + 1
+                    logger.info("Skipping %s: %s", file_path.name, error_msg)
+                    continue
                 if not text or not text.strip():
                     store.update_file_status(file_id, "skipped", "文件为空或无法解析")
                     files_skipped += 1
@@ -1291,7 +1330,12 @@ def reindex_single_file(file_id: int, request: Request, kb: str = Query(default=
             return {"file_id": file_id, "status": "skipped", "reason": f"不支持的文件类型 ({suffix})"}
 
         # Parse
-        text = parser.parse_file(file_path)
+        try:
+            text = parser.parse_file(file_path)
+        except ValueError as parse_err:
+            error_msg = str(parse_err)
+            store.update_file_status(file_id, "skipped", error_msg)
+            return {"file_id": file_id, "status": "skipped", "reason": error_msg}
         if not text or not text.strip():
             store.update_file_status(file_id, "skipped", "文件为空或无法解析")
             return {"file_id": file_id, "status": "skipped", "reason": "文件为空或无法解析"}

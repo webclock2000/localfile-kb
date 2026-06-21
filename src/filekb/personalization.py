@@ -228,10 +228,11 @@ def validate_with_llm(
     llm_client: LLMClient,
     auto_threshold: float = 0.85,
 ) -> list[dict[str, Any]]:
-    """Validate merge proposals with LLM judgment.
+    """Validate merge proposals with LLM judgment — batched.
 
-    Adapted from sift-kg's 'sift resolve' LLM validation stage.
-    Proposals with similarity >= auto_threshold are auto-approved.
+    Instead of calling the LLM once per proposal (100+ calls for a full run),
+    all borderline proposals are sent in a single request.  High-similarity
+    pairs (>= auto_threshold) skip LLM entirely and are auto-approved.
 
     Args:
         proposals: Merge candidate proposals.
@@ -241,51 +242,97 @@ def validate_with_llm(
     Returns:
         Proposals with added 'llm_judgment', 'canonical_name', 'status' fields.
     """
-    validated = []
+    import json
+
+    # ── Split: auto-approved vs. need LLM validation ──
+    auto: list[dict[str, Any]] = []
+    batch: list[dict[str, Any]] = []
+
     for prop in proposals:
-        # Auto-approve high-similarity pairs
         if prop["similarity"] >= auto_threshold:
             prop["status"] = "auto_approved"
             prop["canonical_name"] = max(prop["entity_a"], prop["entity_b"], key=len)
             prop["llm_judgment"] = "auto"
-            validated.append(prop)
-            continue
+            auto.append(prop)
+        else:
+            batch.append(prop)
 
-        # LLM validation for borderline cases
-        try:
-            system_prompt = (
-                "You are an entity resolution assistant. Your job is to determine "
-                "whether two entity names refer to the same real-world thing. "
-                "Respond with a JSON object: "
-                '{"same": true/false, "canonical_name": "preferred name", "reasoning": "..."}'
+    if not batch:
+        return auto
+
+    # ── Batch LLM validation (one call for all borderline proposals) ──
+    try:
+        pairs_text = ""
+        for idx, prop in enumerate(batch):
+            pairs_text += (
+                f"{idx}: A='{prop['entity_a']}' B='{prop['entity_b']}' "
+                f"sim={prop['similarity']:.3f}\n"
             )
-            response = llm_client.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": (
-                        f"Entity A: '{prop['entity_a']}'\nEntity B: '{prop['entity_b']}'\n"
-                        f"Embedding similarity: {prop['similarity']:.3f}\n\n"
-                        "Are these the same entity?"
-                    )},
-                ],
-                max_tokens=256,
-                response_format={"type": "json_object"},
-            )
-            judgment = json.loads(response.content)
-            prop["llm_judgment"] = judgment.get("same", False)
-            prop["canonical_name"] = judgment.get(
+
+        system_prompt = (
+            "You are an entity resolution assistant. For each numbered pair below, "
+            "determine whether the two entity names refer to the same real-world thing. "
+            "Respond with a JSON object containing a 'results' array, one entry per pair:\n"
+            '{"results": [{"id": <number>, "same": true/false, '
+            '"canonical_name": "preferred name", "reasoning": "..."}, ...]}\n'
+            "Only mark 'same':true when highly confident the entities are identical. "
+            "Different numbers, different units, different currencies → NOT same."
+        )
+        response = llm_client.chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": pairs_text},
+            ],
+            max_tokens=2048,
+            response_format={"type": "json_object"},
+        )
+        judgment = json.loads(response.content)
+
+        # Normalize: LLM may return {"results": [...]} or [...] or plain object
+        results: list[dict] = []
+        if isinstance(judgment, list):
+            results = judgment
+        elif isinstance(judgment, dict):
+            results = judgment.get("results", judgment.get("pairs", []))
+            if not isinstance(results, list):
+                # Single-object response (old behavior) — wrap
+                results = [judgment]
+        else:
+            raise ValueError(f"Unexpected LLM response format: {type(judgment)}")
+
+        # Index results by id
+        by_id: dict[int, dict] = {}
+        for r in results:
+            if isinstance(r, dict):
+                by_id[r.get("id", -1)] = r
+
+        for idx, prop in enumerate(batch):
+            r = by_id.get(idx, {})
+            prop["llm_judgment"] = r.get("same", False)
+            prop["canonical_name"] = r.get(
                 "canonical_name",
                 max(prop["entity_a"], prop["entity_b"], key=len),
             )
-            prop["status"] = "proposed" if judgment.get("same") else "rejected"
-        except Exception as e:
-            logger.warning("LLM entity validation failed for '%s'/'%s': %s",
-                           prop["entity_a"], prop["entity_b"], e)
+            prop["status"] = "proposed" if r.get("same") else "rejected"
+
+        logger.info(
+            "Batch LLM validated %d proposals in 1 call: %d same, %d not-same",
+            len(batch),
+            sum(1 for p in batch if p.get("status") == "proposed"),
+            sum(1 for p in batch if p.get("status") == "rejected"),
+        )
+
+    except Exception as e:
+        logger.warning(
+            "Batch LLM validation failed for %d proposals (%s) — "
+            "falling back to proposed status for all",
+            len(batch), e,
+        )
+        for prop in batch:
             prop["status"] = "proposed"
             prop["canonical_name"] = max(prop["entity_a"], prop["entity_b"], key=len)
-        validated.append(prop)
 
-    return validated
+    return auto + batch
 
 
 def apply_merges(
