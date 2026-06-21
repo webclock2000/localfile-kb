@@ -908,10 +908,9 @@ def _run_index_pipeline(
             except Exception as del_err:
                 logger.error("Failed to soft-delete %s: %s", deleted_path, del_err)
 
-        # ── 5-7. Finalize: embeddings + rebuild + run record ──
+        # ── 5-7. Finalize: embeddings + rebuild ──
         _finalize_run(store, vs, gs, kb_name, cfg, files_changed,
                      total_files, total_facts, files_skipped, run_id, start_ts)
-        store.finish_run(run_id, "completed")
 
         # ── 8. Entity resolution (if enabled) ──
         entity_proposals = 0
@@ -964,6 +963,9 @@ def _run_index_pipeline(
                            pruned, cfg.resilience.dlq.prune_days)
         except Exception as e:
             logger.exception("DLQ pruning failed (non-fatal): %s", e)
+
+        # ── Mark run as completed AFTER all steps (including entity resolution which calls LLM) ──
+        store.finish_run(run_id, "completed")
 
         return {
             "run_id": run_id,
