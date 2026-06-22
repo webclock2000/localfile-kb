@@ -88,19 +88,25 @@ def _repair_stale_runs(store: Store) -> None:
             store.conn.commit()
             logger.info("Repaired %d stale running run(s)", rows)
     except Exception:
-        pass
+        logger.exception("Failed to repair stale runs — DB may be locked or missing")
 
 
 def _repair_stale_files(store: Store) -> None:
-    """Reset files stuck in 'processing' back to 'pending', and retry
-    files that previously failed with markitdown conversion errors.
+    """Reset files stuck in 'processing' back to 'pending'.
 
     If the daemon thread died mid-file, the file stays 'processing'
-    forever and is skipped on subsequent runs.  Additionally, files that
-    failed due to the markitdown ``FileConversionException`` bug (fixed in
-    parser.py) are reset so they get a second chance."""
+    forever and is skipped on subsequent runs.  This is the ONLY
+    automatic repair — it recovers from genuine crashes.
+
+    Files in 'failed', 'skipped', or 'dead' state are NOT reset here.
+    'failed' files are retried by the index pipeline only if they still
+    have retry_count < max_retries.  'skipped' (unsupported type) and
+    'dead' (permanently failed) files are never auto-retried.
+
+    To retry a specific failed/skipped file, use the re-index button
+    in the Web UI or ``POST /files/{id}/reindex``.
+    """
     try:
-        # Reset stuck processing files
         rows = store.conn.execute(
             "SELECT COUNT(*) FROM files WHERE status = 'processing'"
         ).fetchone()[0]
@@ -109,35 +115,9 @@ def _repair_stale_files(store: Store) -> None:
                 "UPDATE files SET status = 'pending' WHERE status = 'processing'"
             )
             store.conn.commit()
-            logger.info("Reset %d processing file(s) back to pending", rows)
+            logger.info("Reset %d processing file(s) back to pending (crash recovery)", rows)
     except Exception:
-        pass
-
-    # Also reset files that failed/skipped due to transient errors
-    # (server restart during indexing, markitdown bugs, missing OCR deps, etc.)
-    # These are not file-specific problems — retrying will succeed.
-    _transient_repairs = [
-        # (status, error_pattern, description)
-        ('failed', '%Cannot operate on a closed database%', 'server restart mid-index'),
-        ('failed', '%Could not convert%Markdown%', 'markitdown conversion bug'),
-        ('skipped', '%文件为空或无法解析%', 'empty parse (possible OCR/env issue)'),
-    ]
-    for status, pattern, desc in _transient_repairs:
-        try:
-            rows = store.conn.execute(
-                f"SELECT COUNT(*) FROM files WHERE status = ? "
-                "AND error_msg LIKE ?", (status, pattern)
-            ).fetchone()[0]
-            if rows:
-                store.conn.execute(
-                    f"UPDATE files SET status = 'pending', error_msg = NULL "
-                    "WHERE status = ? AND error_msg LIKE ?", (status, pattern)
-                )
-                store.conn.commit()
-                logger.info("Reset %d transient-%s file(s) for auto-retry (%s)",
-                           rows, status, desc)
-        except Exception:
-            pass
+        logger.exception("Failed to repair stale files — DB may be locked or missing")
 
 
 def _init_kb_state(app: FastAPI, kb_name: str) -> None:
@@ -155,6 +135,12 @@ def _init_kb_state(app: FastAPI, kb_name: str) -> None:
     # Clean up stale state from prior daemon-thread crashes
     _repair_stale_runs(store)
     _repair_stale_files(store)
+
+    # Clear any stale stop signals from previous crashed runs
+    try:
+        store.clear_pending_stops()
+    except Exception:
+        pass
     vs = VectorStore(dimension=1024)
     if not vs.load(faiss_dir):
         # Backfill: compute embeddings if facts exist but FAISS is empty
@@ -645,7 +631,14 @@ def _run_index_pipeline(
     """
 
     def _should_stop() -> bool:
-        return stop_event is not None and stop_event.is_set()
+        # Check in-memory event (fast path)
+        if stop_event is not None and stop_event.is_set():
+            return True
+        # Check persistent DB flag (survives server restart)
+        try:
+            return store.is_stop_requested(run_id)
+        except Exception:
+            return False
 
     run_id = store.start_run()
     start_ts = time.time()
@@ -656,6 +649,23 @@ def _run_index_pipeline(
     skip_reasons: dict[str, int] = {}  # reason → count
     all_files_to_process: list[str] = []
     all_deleted: list[str] = []
+
+    # ── Repair: reset stuck "processing" files to "pending" ──
+    # This is also done at server startup (_init_kb_state), but a daemon
+    # thread crash mid-session can leave files "processing" without a
+    # server restart.  Always repair before scanning.
+    try:
+        rows = store.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE status = 'processing'"
+        ).fetchone()[0]
+        if rows:
+            store.conn.execute(
+                "UPDATE files SET status = 'pending' WHERE status = 'processing'"
+            )
+            store.conn.commit()
+            logger.info("Repaired %d stuck processing file(s) → pending", rows)
+    except Exception:
+        logger.exception("Failed to repair stuck processing files")
 
     try:
         # ── DLQ-only mode: retry failed chunks, skip file scan ──
@@ -702,27 +712,77 @@ def _run_index_pipeline(
                 len(changes["deleted"]), len(changes["unchanged"]),
             )
 
-        # ── Also retry previously failed/skipped/pending/processing files ──
-        # "pending" files have their SHA256 in the DB (from upsert_file),
-        # so detect_changes won't flag them as "new".  We must explicitly
-        # re-process them or they'll be stuck forever.
+        # ── Also include files that genuinely need (re)processing ──
+        # "pending" files are new (never indexed) or were reset from
+        # "processing" by crash recovery.  They must be picked up here
+        # because upsert_file already wrote their SHA256 into the DB,
+        # so detect_changes won't flag them as "added".
+        #
+        # "failed" files are retried ONLY if they still have retry budget
+        # (retry_count < MAX_FILE_RETRIES).  Each retry increments the
+        # counter; after the budget is exhausted the file is marked "dead".
+        #
+        # "skipped" (unsupported type, empty content, encrypted) and
+        # "dead" (permanent failure) files are NEVER auto-retried.
+        # They can only be re-indexed via the explicit re-index button
+        # or API, which resets their status to "pending".
+        MAX_FILE_RETRIES = 3
+
         retry_files: list[str] = []
-        for status in ("failed", "skipped", "pending", "processing"):
-            for row in store.get_files_by_status(status):
-                p = row["path"]
-                if Path(p).exists() and any(
-                    p.startswith(str(Path(d.path).expanduser()))
-                    for d in kb_dirs
-                ):
-                    retry_files.append(p)
+        dead_files: list[str] = []
+
+        # ── pending files: new or crash-recovered ──
+        for row in store.get_files_by_status("pending"):
+            p = row["path"]
+            if Path(p).exists() and any(
+                p.startswith(str(Path(d.path).expanduser()))
+                for d in kb_dirs
+            ):
+                retry_files.append(p)
+
+        # ── failed files: only if within retry budget ──
+        for row in store.get_files_by_status("failed"):
+            p = row["path"]
+            if not Path(p).exists():
+                continue
+            if not any(p.startswith(str(Path(d.path).expanduser())) for d in kb_dirs):
+                continue
+            file_retry_count = row["retry_count"] if "retry_count" in row.keys() else 0
+            if file_retry_count < MAX_FILE_RETRIES:
+                retry_files.append(p)
+                logger.info(
+                    "Retrying failed file (attempt %d/%d): %s",
+                    file_retry_count + 1, MAX_FILE_RETRIES, p,
+                )
+            else:
+                # Exhausted retries — mark as dead
+                store.mark_file_dead(
+                    row["id"],
+                    f"重试 {file_retry_count} 次后仍然失败: {row['error_msg'] or '未知错误'}",
+                )
+                dead_files.append(p)
+                logger.warning("Marked as dead (retries exhausted): %s", p)
+
         if retry_files:
-            logger.info("Re-processing %d previously failed/skipped files", len(retry_files))
-            # Avoid duplicates
+            logger.info(
+                "Re-processing %d files (%d pending + %d failed within budget)",
+                len(retry_files),
+                sum(1 for f in retry_files
+                    if any(r["path"] == f and r["status"] == "pending"
+                           for r in store.get_files_by_status("pending"))),
+                sum(1 for f in retry_files
+                    if any(r["path"] == f and r["status"] == "failed"
+                           for r in store.get_files_by_status("failed"))),
+            )
+            # Avoid duplicates with SHA256-detected changes
             existing = set(all_files_to_process)
             for p in retry_files:
                 if p not in existing:
                     all_files_to_process.append(p)
                     existing.add(p)
+
+        if dead_files:
+            logger.info("%d file(s) marked dead (permanently skipped)", len(dead_files))
 
         if not all_files_to_process and not all_deleted:
             logger.info("KB '%s': no changes detected", kb_name)
@@ -931,7 +991,21 @@ def _run_index_pipeline(
                 logger.error("Failed to process file %s: %s", file_path_str, file_err)
                 try:
                     if 'file_id' in dir():
-                        store.update_file_status(file_id, "failed", str(file_err))
+                        # Increment retry count
+                        new_count = store.increment_retry_count(file_id)
+                        if new_count >= MAX_FILE_RETRIES:
+                            store.mark_file_dead(
+                                file_id,
+                                f"重试 {new_count} 次后仍然失败: {file_err}",
+                            )
+                            logger.warning(
+                                "File marked dead after %d retries: %s",
+                                new_count, file_path_str,
+                            )
+                        else:
+                            store.update_file_status(
+                                file_id, "failed", str(file_err),
+                            )
                 except BaseException:
                     pass
 
@@ -1080,6 +1154,12 @@ def index_endpoint(req: IndexRequest, request: Request):
     gs = _kb_gs(request, kb)
     cfg = request.app.state.config
 
+    # Clear any stale stop signals from previous crashed runs
+    try:
+        store.clear_pending_stops()
+    except Exception:
+        pass
+
     stop_event = threading.Event()
     request.app.state.kb_stop_events[kb] = stop_event
 
@@ -1142,7 +1222,20 @@ def index_stop_endpoint(request: Request, kb: str = Query(default="默认")):
     stop_event = request.app.state.kb_stop_events.get(kb)
     if stop_event is None:
         return {"status": "idle", "message": f"「{kb}」当前没有运行中的索引任务。"}
+
+    # Set in-memory event
     stop_event.set()
+
+    # Persist to DB so it survives server restarts
+    try:
+        store = _kb_store(request, kb)
+        last_run = store.get_last_run()
+        if last_run and last_run["status"] == "running":
+            store.set_stop_requested(last_run["id"])
+            logger.info("Stop signal persisted to DB for run %d (KB: %s)", last_run["id"], kb)
+    except Exception:
+        logger.exception("Failed to persist stop signal to DB")
+
     return {"status": "stopping", "message": f"已请求停止「{kb}」的索引——当前文件处理完毕后将安全退出。"}
 
 
@@ -1312,8 +1405,9 @@ def reindex_single_file(file_id: int, request: Request, kb: str = Query(default=
     logger.info("Single-file reindex requested: %s (id=%d)", file_path.name, file_id)
 
     try:
-        # Reset file state
+        # Reset file state — explicit re-index resets retry counter
         store.update_file_status(file_id, "processing")
+        store.reset_retry_count(file_id)
         store.soft_delete_facts_by_file(file_id)
         store.delete_chunks_by_file(file_id)  # Fix 2: prevent chunk leak
 

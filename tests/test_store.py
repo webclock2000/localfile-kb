@@ -8,7 +8,7 @@ class TestStoreSchema:
     def test_store_creates_schema(self, store):
         """Store initializes with correct schema version and tables."""
         ver = store.conn.execute("PRAGMA user_version").fetchone()[0]
-        assert ver == 4
+        assert ver == 5
 
         tables = [
             r[0]

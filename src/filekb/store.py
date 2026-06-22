@@ -19,7 +19,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 # ============================================================================
@@ -115,36 +115,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_history_session
     ON chat_history(kb_name, session_id, created_at);
 """
 
-SCHEMA_V4 = """
-CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kb_name TEXT NOT NULL DEFAULT '默认',
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-    content TEXT NOT NULL,
-    sources TEXT DEFAULT '[]',
-    related_facts TEXT DEFAULT '[]',
-    feedback_given TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_chat_history_session
-    ON chat_history(kb_name, session_id, created_at);
-"""
-
-SCHEMA_V4 = """
-CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kb_name TEXT NOT NULL DEFAULT '默认',
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-    content TEXT NOT NULL,
-    sources TEXT DEFAULT '[]',
-    related_facts TEXT DEFAULT '[]',
-    feedback_given TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_chat_history_session
-    ON chat_history(kb_name, session_id, created_at);
+SCHEMA_V5 = """
+ALTER TABLE files ADD COLUMN retry_count INTEGER DEFAULT 0;
+ALTER TABLE runs ADD COLUMN stop_requested INTEGER DEFAULT 0;
 """
 
 SCHEMA_V2 = """
@@ -253,6 +226,11 @@ class Store:
             self.conn.executescript(SCHEMA_V4)
             self.conn.execute("PRAGMA user_version = 4")
             logger.info("Migrated DB to schema v4")
+            current = 4
+        if current < 5:
+            self.conn.executescript(SCHEMA_V5)
+            self.conn.execute("PRAGMA user_version = 5")
+            logger.info("Migrated DB to schema v5 (retry_count + stop_requested)")
 
     # ------------------------------------------------------------------
     # Directory CRUD
@@ -377,6 +355,33 @@ class Store:
         self.conn.execute(
             "UPDATE files SET status = ?, error_msg = ? WHERE id = ?",
             (status, error_msg, file_id),
+        )
+        self.conn.commit()
+
+    def increment_retry_count(self, file_id: int) -> int:
+        """Increment retry_count for a file, return new count."""
+        self.conn.execute(
+            "UPDATE files SET retry_count = retry_count + 1 WHERE id = ?",
+            (file_id,),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT retry_count FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+        return row["retry_count"] if row else 0
+
+    def reset_retry_count(self, file_id: int) -> None:
+        """Reset retry_count to 0 (e.g., file content changed)."""
+        self.conn.execute(
+            "UPDATE files SET retry_count = 0 WHERE id = ?", (file_id,)
+        )
+        self.conn.commit()
+
+    def mark_file_dead(self, file_id: int, error_msg: str) -> None:
+        """Mark a file as permanently failed (dead) — exceeds retry limit."""
+        self.conn.execute(
+            "UPDATE files SET status = 'dead', error_msg = ? WHERE id = ?",
+            (error_msg, file_id),
         )
         self.conn.commit()
 
@@ -666,7 +671,8 @@ class Store:
 
     def finish_run(self, run_id: int, status: str = "completed") -> None:
         self.conn.execute(
-            "UPDATE runs SET status = ?, finished_at = datetime('now') WHERE id = ?",
+            "UPDATE runs SET status = ?, finished_at = datetime('now'), "
+            "stop_requested = 0 WHERE id = ?",
             (status, run_id),
         )
         self.conn.commit()
@@ -675,6 +681,27 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
+
+    def set_stop_requested(self, run_id: int) -> None:
+        """Persist stop signal to DB so it survives server restarts."""
+        self.conn.execute(
+            "UPDATE runs SET stop_requested = 1 WHERE id = ?", (run_id,)
+        )
+        self.conn.commit()
+
+    def is_stop_requested(self, run_id: int) -> bool:
+        """Check if stop was requested for this run."""
+        row = self.conn.execute(
+            "SELECT stop_requested FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return bool(row and row["stop_requested"])
+
+    def clear_pending_stops(self) -> None:
+        """Clear stop_requested flags on all stale runs."""
+        self.conn.execute(
+            "UPDATE runs SET stop_requested = 0 WHERE stop_requested = 1"
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # User feedback
