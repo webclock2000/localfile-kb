@@ -158,12 +158,50 @@ def generate_proposals(
         List of proposal dicts {entity_a, entity_b, similarity, ...}.
     """
     from filekb.embed import embed_batch
+    from filekb.entity_qa import (
+        _is_numeric_dominant,
+        _looks_like_code,
+        compute_gibberish_score,
+    )
 
-    entities = graph_store.all_entities()
-    if len(entities) < 2:
+    all_entities = graph_store.all_entities()
+    if len(all_entities) < 2:
         return []
 
-    # Embed all entity names
+    # ── Pre-filter: skip entities that are clearly garbage ──
+    # This prevents numeric values, codes, and gibberish from generating
+    # meaningless merge proposals (e.g. "0.50万" ↔ "1.00万元").
+    skip_entities: set[str] = set()
+    for name in all_entities:
+        # Skip purely numeric/value entities (medical readings, currency, etc.)
+        if _is_numeric_dominant(name):
+            skip_entities.add(name)
+            continue
+        # Skip code-like entities (bank card numbers, IDs, etc.)
+        if _looks_like_code(name):
+            skip_entities.add(name)
+            continue
+        # Skip high-gibberish entities (entropy anomalies, repeated n-grams)
+        if compute_gibberish_score(name) >= 0.5:
+            skip_entities.add(name)
+            continue
+
+    entities = [e for e in all_entities if e not in skip_entities]
+    if len(entities) < 2:
+        logger.info(
+            "Pre-filter skipped %d/%d entities, too few remaining for merge proposals",
+            len(skip_entities), len(all_entities),
+        )
+        return []
+
+    if skip_entities:
+        logger.info(
+            "Pre-filter skipped %d suspect entities (numeric/code/gibberish), "
+            "%d remaining for merge proposal generation",
+            len(skip_entities), len(entities),
+        )
+
+    # Embed remaining entity names
     embeddings = embed_batch(entities)
 
     # Compute pairwise similarities (limited to avoid O(n²))

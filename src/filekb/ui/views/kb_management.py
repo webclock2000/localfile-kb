@@ -399,10 +399,16 @@ with dkb_col:
 
 st.caption(f"「{selected_kb}」的监控目录列表。添加目录后，文件变更会自动入库。")
 
-# Directory list
-real_dirs = [d for d in kb_map.get(selected_kb, []) if d.get("path")]
+# Directory list (deduplicated by path — API may return duplicates)
+raw_dirs = [d for d in kb_map.get(selected_kb, []) if d.get("path")]
+seen: set[str] = set()
+real_dirs: list[dict] = []
+for d in raw_dirs:
+    if d["path"] not in seen:
+        seen.add(d["path"])
+        real_dirs.append(d)
 if real_dirs:
-    for d in real_dirs:
+    for i, d in enumerate(real_dirs):
         with st.container(border=True):
             dc1, dc2 = st.columns([10, 1])
             with dc1:
@@ -411,7 +417,7 @@ if real_dirs:
             with dc2:
                 if st.button(
                     "🗑",
-                    key=f"rmdir_{d['path']}",
+                    key=f"rmdir_{i}_{d['path']}",
                     help="从该知识库的监控列表中移除此目录。目录中的文件不会被删除。",
                 ):
                     try:

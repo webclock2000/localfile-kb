@@ -62,27 +62,51 @@ class GraphStore:
     def rebuild_from_facts(self, facts: list[dict[str, Any]]) -> None:
         """Rebuild the entire graph from a list of fact dicts.
 
+        Literal values (numeric amounts, dates, codes) detected in the object
+        position are demoted to node properties on the subject, rather than
+        becoming standalone graph nodes.
+
         Args:
             facts: List of dicts with keys: id, subject, predicate, object, confidence.
         """
         import networkx as nx
 
+        from filekb.entity_qa import is_literal_value
+
         g = nx.DiGraph()
+        literal_count = 0
+
         for fact in facts:
             subj = fact["subject"]
             obj = fact["object"]
             g.add_node(subj, label=subj)
-            g.add_node(obj, label=obj)
-            g.add_edge(
-                subj,
-                obj,
-                fact_id=fact.get("id", 0),
-                predicate=fact.get("predicate", ""),
-                confidence=fact.get("confidence", 50),
-            )
+
+            if is_literal_value(obj):
+                # Demote literal value to a property on the subject node.
+                # No standalone node or edge is created for it.
+                props = g.nodes[subj].setdefault("properties", {})
+                pred = fact.get("predicate", "")
+                if pred not in props:
+                    props[pred] = []
+                props[pred].append(obj)
+                literal_count += 1
+            else:
+                g.add_node(obj, label=obj)
+                g.add_edge(
+                    subj,
+                    obj,
+                    fact_id=fact.get("id", 0),
+                    predicate=fact.get("predicate", ""),
+                    confidence=fact.get("confidence", 50),
+                )
 
         self.graph = g
-        logger.info("Graph rebuilt: %d nodes, %d edges", g.number_of_nodes(), g.number_of_edges())
+        logger.info(
+            "Graph rebuilt: %d nodes, %d edges (%d literal values demoted to properties)",
+            g.number_of_nodes(),
+            g.number_of_edges(),
+            literal_count,
+        )
 
     # ------------------------------------------------------------------
     # Traversal

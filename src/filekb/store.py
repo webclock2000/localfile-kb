@@ -960,6 +960,268 @@ class Store:
         self.conn.commit()
         return cur.rowcount
 
+    def batch_entity_operations(
+        self,
+        operations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Execute a batch of entity rename/delete operations in one transaction.
+
+        After all operations complete, the caller is responsible for
+        rebuilding the graph and FAISS index.
+
+        Args:
+            operations: List of {"action": "rename"|"delete", "entity": str,
+                                  "new_name": str (rename only)} dicts.
+
+        Returns:
+            List of result dicts with "action", "entity", "success", and
+            action-specific fields ("facts_updated" or "facts_deleted").
+        """
+        results: list[dict[str, Any]] = []
+
+        for op in operations:
+            action = op.get("action", "")
+            entity = op.get("entity", "")
+
+            if not entity:
+                results.append({
+                    "action": action, "entity": entity,
+                    "success": False, "error": "entity name is required",
+                })
+                continue
+
+            if action == "rename":
+                new_name = op.get("new_name", "").strip()
+                if not new_name or new_name == entity:
+                    results.append({
+                        "action": "rename", "entity": entity,
+                        "success": False, "error": "new_name is required and must differ",
+                    })
+                    continue
+
+                try:
+                    updated = self.rename_entity(entity, new_name)
+                    # Insert protection record for new name
+                    self.insert_proposal(
+                        entity_a=new_name,
+                        entity_b="",
+                        confidence=1.0,
+                        status="approved",
+                        proposal_type="suspect",
+                        llm_response=json.dumps({
+                            "reason": f"用户从「{entity}」批量重命名",
+                            "flags": [],
+                            "gibberish_score": 0,
+                        }, ensure_ascii=False),
+                    )
+                    results.append({
+                        "action": "rename", "entity": entity,
+                        "new_name": new_name, "success": True,
+                        "facts_updated": updated,
+                    })
+                except Exception as e:
+                    logger.error("Batch rename failed for '%s': %s", entity, e)
+                    results.append({
+                        "action": "rename", "entity": entity,
+                        "success": False, "error": str(e),
+                    })
+
+            elif action == "delete":
+                try:
+                    deleted = self.delete_entity_facts(entity)
+                    results.append({
+                        "action": "delete", "entity": entity,
+                        "success": True, "facts_deleted": deleted,
+                    })
+                except Exception as e:
+                    logger.error("Batch delete failed for '%s': %s", entity, e)
+                    results.append({
+                        "action": "delete", "entity": entity,
+                        "success": False, "error": str(e),
+                    })
+            else:
+                results.append({
+                    "action": action, "entity": entity,
+                    "success": False, "error": f"unknown action: {action}",
+                })
+
+        self.conn.commit()
+        return results
+
+    def list_entities_with_stats(
+        self,
+        *,
+        search: str | None = None,
+        sort_by: str = "count",
+        order: str = "desc",
+        page: int = 1,
+        page_size: int = 50,
+        suspect_only: bool = False,
+        merge_proposal_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List all entities with occurrence count and metadata.
+
+        Args:
+            search: Optional substring filter on entity name.
+            sort_by: "count" (occurrence), "name" (alphabetical), or "degree".
+            order: "asc" or "desc".
+            page: 1-based page number.
+            page_size: Items per page (max 200).
+            suspect_only: Only return entities with pending suspect proposals.
+            merge_proposal_only: Only return entities with pending merge proposals.
+
+        Returns:
+            (entities_list, total_count)
+            Each entity dict: {name, fact_count, has_suspect_proposal,
+                               has_merge_proposal, suspect_flags}
+        """
+        page_size = min(page_size, 200)
+        offset = (page - 1) * page_size
+
+        # Build the base query: entity occurrence counts
+        where_clauses: list[str] = []
+        having_clauses: list[str] = []
+        params: list[Any] = []
+        count_params: list[Any] = []
+
+        if search:
+            where_clauses.append("e.entity LIKE ?")
+            params.append(f"%{search}%")
+
+        # ── suspect_only / merge_proposal_only: push filter into SQL ──
+        # Using JOIN instead of post-filter so filtering happens BEFORE
+        # pagination.  Otherwise low-count suspect entities never appear
+        # on the first page.
+        join_clause = ""
+        if suspect_only:
+            join_clause = (
+                "JOIN entity_proposals ep ON e.entity = ep.entity_a "
+                "AND ep.proposal_type = 'suspect' AND ep.status = 'proposed'"
+            )
+        elif merge_proposal_only:
+            join_clause = (
+                "JOIN entity_proposals ep ON (e.entity = ep.entity_a OR e.entity = ep.entity_b) "
+                "AND ep.proposal_type = 'merge' AND ep.status = 'proposed'"
+            )
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        # ── Literal-value filtering: match graph_store.rebuild_from_facts() ──
+        # Graph logic: ALL subjects become nodes; objects only if NOT literal.
+        # We replicate that exactly so entity list count == graph node count.
+        from filekb.entity_qa import is_literal_value
+
+        # Get all distinct subjects (always included, matching graph behavior)
+        subj_sql = f"""
+            SELECT e.entity FROM (
+                SELECT DISTINCT subject AS entity FROM facts WHERE status = 'active'
+            ) e
+            {join_clause}
+            {where_sql}
+        """
+        subj_rows = self.conn.execute(subj_sql, params).fetchall()
+        subject_set = {r["entity"] for r in subj_rows}
+
+        # Get all distinct objects (only non-literal ones count)
+        obj_sql = f"""
+            SELECT e.entity FROM (
+                SELECT DISTINCT object AS entity FROM facts WHERE status = 'active'
+            ) e
+            {join_clause}
+            {where_sql}
+        """
+        obj_rows = self.conn.execute(obj_sql, params).fetchall()
+        non_literal_objs = {r["entity"] for r in obj_rows if not is_literal_value(r["entity"])}
+
+        # Valid entities = same set the graph would produce
+        valid_entities = subject_set | non_literal_objs
+        total = len(valid_entities)
+
+        order_clause = "ORDER BY total_count DESC"
+        if sort_by == "name":
+            order_clause = "ORDER BY entity ASC" if order == "asc" else "ORDER BY entity DESC"
+        elif sort_by == "degree":
+            order_clause = "ORDER BY total_count DESC"  # degree ≈ count proxy
+        # default: count desc
+
+        # Fetch extra rows to account for literal-value filtering
+        fetch_limit = min(page_size * 3, 1000)
+        query_sql = f"""
+            SELECT
+                e.entity,
+                SUM(e.cnt) AS total_count
+            FROM (
+                SELECT subject AS entity, COUNT(*) AS cnt
+                FROM facts WHERE status = 'active'
+                GROUP BY subject
+                UNION ALL
+                SELECT object AS entity, COUNT(*) AS cnt
+                FROM facts WHERE status = 'active'
+                GROUP BY object
+            ) e
+            {join_clause}
+            {where_sql}
+            GROUP BY e.entity
+            {order_clause}
+            LIMIT ? OFFSET 0
+        """
+        rows = self.conn.execute(query_sql, params + [fetch_limit]).fetchall()
+
+        # ── Filter: keep only entities the graph would keep ──
+        rows = [r for r in rows if r["entity"] in valid_entities]
+
+        # Slice for the requested page
+        offset = (page - 1) * page_size
+        page_rows = rows[offset:offset + page_size]
+
+        if not page_rows:
+            return [], total
+
+        # Gather entity names for proposal lookups
+        entity_names = [r["entity"] for r in page_rows]
+        placeholders = ",".join("?" * len(entity_names))
+
+        # Fetch suspect proposals for these entities (for the badge display)
+        suspect_rows = self.conn.execute(
+            f"""SELECT entity_a FROM entity_proposals
+                WHERE entity_a IN ({placeholders})
+                  AND proposal_type = 'suspect'
+                  AND status = 'proposed'""",
+            entity_names,
+        ).fetchall()
+        suspect_set = {r["entity_a"] for r in suspect_rows}
+
+        # Fetch merge proposals for these entities (for the badge display)
+        merge_set: set[str] = set()
+        if not merge_proposal_only:  # already filtered by JOIN if set
+            merge_rows = self.conn.execute(
+                f"""SELECT entity_a, entity_b FROM entity_proposals
+                    WHERE (entity_a IN ({placeholders}) OR entity_b IN ({placeholders}))
+                      AND proposal_type = 'merge'
+                      AND status = 'proposed'""",
+                entity_names + entity_names,
+            ).fetchall()
+            for r in merge_rows:
+                if r["entity_a"] in entity_names:
+                    merge_set.add(r["entity_a"])
+                if r["entity_b"] in entity_names:
+                    merge_set.add(r["entity_b"])
+
+        # Build result
+        entities_list: list[dict[str, Any]] = []
+        for row in page_rows:
+            name = row["entity"]
+            e = {
+                "name": name,
+                "fact_count": row["total_count"],
+                "has_suspect_proposal": name in suspect_set,
+                "has_merge_proposal": name in merge_set,
+                "suspect_flags": [],
+            }
+            entities_list.append(e)
+
+        return entities_list, total
+
     def __enter__(self) -> Store:
         return self
 

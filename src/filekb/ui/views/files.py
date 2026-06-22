@@ -149,7 +149,21 @@ try:
         if is_stopping:
             _stop_waiting_fragment(kb)
         elif is_running:
-            # Index is running — show STOP button
+            # Index is running — show STOP button (red)
+            st.html("""
+            <style>
+            /* 停止索引 → 红色 */
+            button[kind="secondary"][data-testid="baseButton-secondary"] {
+                background-color: #dc2626 !important;
+                border-color: #dc2626 !important;
+                color: white !important;
+            }
+            button[kind="secondary"][data-testid="baseButton-secondary"]:hover {
+                background-color: #b91c1c !important;
+                border-color: #b91c1c !important;
+            }
+            </style>
+            """)
             if st.button(
                 "⏹ 停止索引",
                 use_container_width=True,
@@ -169,7 +183,20 @@ try:
                 except Exception as e:
                     st.error(f"错误: {e}")
         else:
-            # Index is NOT running — show START button
+            # Index is NOT running — show START button (green)
+            st.html("""
+            <style>
+            /* 开始索引 → 绿色 */
+            button[kind="primary"] {
+                background-color: #16a34a !important;
+                border-color: #16a34a !important;
+            }
+            button[kind="primary"]:hover {
+                background-color: #15803d !important;
+                border-color: #15803d !important;
+            }
+            </style>
+            """)
             idx_help = (
                 "扫描「{0}」的所有监控目录，检测文件变更（新增/修改/删除），"
                 "解析文件内容并通过 LLM 提取实体和关系，更新向量索引和知识图谱。"

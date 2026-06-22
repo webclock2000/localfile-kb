@@ -20,15 +20,22 @@ st.title("🔗 知识图谱浏览")
 st.caption(f"探索「{kb}」中实体之间的关联关系。支持模糊搜索。")
 
 # ── Search toolbar ──
-tc1, tc2, tc3 = st.columns([3, 1, 1])
+tc1, tc2, tc3 = st.columns([5, 1, 1])
 with tc1:
     entity_query = st.text_input(
         "搜索实体",
-        placeholder="例如：遥感、邓磊、张三",
+        placeholder="输入实体名称，如：遥感、邓磊",
         label_visibility="collapsed",
     )
 with tc2:
-    hop = st.selectbox("扩展跳数", [1, 2, 3], index=0)
+    hop = st.selectbox(
+        "扩展跳数",
+        [1, 2, 3],
+        index=0,
+        format_func=lambda x: f"跳数: {x}",
+        label_visibility="collapsed",
+        help="图谱扩展范围：1=直接关联，2=二级关联，3=三级关联",
+    )
 with tc3:
     if st.button("🔍 搜索", use_container_width=True, help="在知识图谱中搜索该实体及其关联关系"):
         pass  # Trigger rerun with current inputs

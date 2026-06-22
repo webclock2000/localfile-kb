@@ -260,6 +260,214 @@ def _is_valid_chinese_word(name: str) -> bool:
 
 
 # ============================================================================
+# Numeric / code entity detection
+# ============================================================================
+
+# Common Chinese units and measure words that indicate a numeric+unit entity
+_NUMERIC_UNIT_PATTERNS = [
+    r'[元块角分]$',           # currency
+    r'万元?$',                # 万元/万
+    r'[亿万千百]元?$',
+    r'[天年月日周时分钟秒]$',
+    r'[个只条件次项笔张份篇页本节章]$',
+    r'[%％]$',                # percentage
+    r'[倍成]$',               # multiplier
+    r'[点份股手]$',           # financial units
+    r'ng/ml$', r'ng/mL$', r'ng/dl$', r'ng/L$',  # medical units
+    r'mmol/L$', r'mmol/l$', r'μmol/L$',
+    r'pg/ml$', r'pg/mL$', r'g/L$', r'mg/L$',
+    r'U/L$', r'U/ml$', r'mIU/L$',
+    r'[×xX]10\^?\d+/L$',     # scientific notation units
+    r'kg$', r'g$', r'mg$', r'μg$',
+    r'[mkc]?m$',              # length
+    r'[kMGT]?Hz$',            # frequency
+    r'[kMGT]?B$',             # bytes
+    r'[kMGT]?bps$',           # bandwidth
+]
+
+# Patterns for IDs/codes — long digit strings that aren't meaningful numbers
+_CODE_PATTERNS = [
+    # Pure digit strings >= 8 chars (account numbers, IDs)
+    re.compile(r'^\d{8,}$'),
+    # Digit-dash patterns like "010-58887486" (phone) or dates
+    re.compile(r'^\d{2,4}[-/]\d{2,4}[-/]\d{2,8}$'),
+    # Alphanumeric codes with few letters (like "19220010031")
+    re.compile(r'^\d{6,}[A-Za-z]{1,3}\d*$'),
+    # Very long alphanumeric codes — must contain at least some digits
+    # (pure-alpha strings like "HeadwallPhotonics" are named entities)
+    re.compile(r'^(?=.*\d)[A-Za-z0-9]{12,}$'),
+]
+
+# Numbers that look like Chinese ID card numbers (18 digits)
+_ID_CARD_RE = re.compile(r'^\d{17}[\dXx]$')
+
+# Numbers that look like phone numbers (Chinese mobile: 11 digits; landline: 3-4 area + 7-8 local)
+_PHONE_RE = re.compile(r'^\d{3}[-]?\d{7,8}$|^\d{4}[-]?\d{7,8}$|^\d{11}$')
+
+
+def _is_numeric_dominant(name: str) -> bool:
+    """Check if an entity is dominated by numeric/value content.
+
+    Returns True for entities like:
+    - "0.160ng/ml", "50,000元", "0.50万元", "+40.00元"
+    - "000333" (pure digits)
+    - "3.50" (decimal number)
+    - "-16,779.87元" (signed currency)
+    """
+    if not name or not name.strip():
+        return False
+
+    stripped = name.strip()
+
+    # Count digit chars
+    digit_chars = sum(1 for ch in stripped if ch.isdigit())
+    total_chars = len(stripped)
+
+    if total_chars == 0:
+        return False
+
+    # Rule A: Pure digits (or digits with minimal separators)
+    cleaned = re.sub(r'[,，\s\'"]', '', stripped)
+    if cleaned and all(ch.isdigit() or ch in '.+-' for ch in cleaned):
+        digit_ratio = sum(1 for ch in cleaned if ch.isdigit()) / max(len(cleaned), 1)
+        if digit_ratio >= 0.5 and len(cleaned) >= 2:
+            return True
+
+    # Rule B: Digit-dominant with units (e.g. "50,000元", "0.160ng/ml")
+    if digit_chars >= total_chars * 0.3:
+        # Check if has a numeric prefix followed by unit pattern
+        for pattern in _NUMERIC_UNIT_PATTERNS:
+            if re.search(pattern, stripped):
+                # Confirm there's a numeric part
+                if re.search(r'\d', stripped):
+                    return True
+
+    # Rule C: Leading number with known unit suffixes
+    # e.g. "0.50万元", "-16,779.87元", "+40.00元", "3.50 万"
+    if re.match(r'^[-+]?\s*[\d,，.\s]+', stripped):
+        # Has a clear numeric prefix
+        non_numeric_part = re.sub(r'^[-+]?\s*[\d,，.\s]+', '', stripped)
+        # Short non-numeric suffix = likely unit
+        if len(non_numeric_part) <= 6 and digit_chars >= 2:
+            return True
+
+    return False
+
+
+def _looks_like_code(name: str) -> bool:
+    """Check if an entity looks like a code, ID, or identifier string.
+
+    Returns True for entities like:
+    - "6222080200008516588" (bank card number)
+    - "19220010031" (student ID)
+    - "01091565100120109006008" (long numeric code)
+    - "37060219760210161X" (ID card number)
+    """
+    if not name or not name.strip():
+        return False
+
+    stripped = name.strip()
+
+    # ID card number pattern (18 digits, possibly ending in X)
+    if _ID_CARD_RE.match(stripped):
+        return True
+
+    # Phone-like numbers: skip — they have real-world meaning
+    if _PHONE_RE.match(stripped):
+        return False
+
+    # Check code patterns
+    for pat in _CODE_PATTERNS:
+        if pat.match(stripped):
+            return True
+
+    # Digit-only but with specific length patterns
+    if stripped.isdigit():
+        n = len(stripped)
+        # 6-7 digits: could be verification codes, order numbers
+        # 8-10 digits: account numbers
+        # 11+ digits: definitely a code
+        if n >= 8:
+            return True
+
+    return False
+
+
+# Date patterns — entities that are clearly dates/times, not real-world entities
+_DATE_PATTERNS = [
+    # Chinese dates: 2024年, 1976年2月10日, 2021年12月23日
+    re.compile(r'^\d{4}年(\d{1,2}月(\d{1,2}日?)?)?$'),
+    # ISO dates: 2018-07-30, 2024-01
+    re.compile(r'^\d{4}-\d{2}(-\d{2})?$'),
+    # Slash dates: 2024/01/30
+    re.compile(r'^\d{4}/\d{1,2}(/\d{1,2})?$'),
+    # Dot dates: 2024.01.30
+    re.compile(r'^\d{4}\.\d{1,2}(\.\d{1,2})?$'),
+    # Time patterns: 14:30, 14:30:00
+    re.compile(r'^\d{1,2}:\d{2}(:\d{2})?$'),
+    # Relative dates with units: 365天, 3个月
+    re.compile(r'^\d+\s*[天年月日周时分钟秒]$'),
+]
+
+
+def _looks_like_date(name: str) -> bool:
+    """Check if an entity looks like a date or time expression.
+
+    These should be values/attributes, not standalone entities in the graph.
+    """
+    if not name or not name.strip():
+        return False
+
+    stripped = name.strip()
+
+    for pat in _DATE_PATTERNS:
+        if pat.match(stripped):
+            return True
+
+    # Also catch: pure 4-digit year (e.g., "2024") with nothing else
+    if re.match(r'^\d{4}$', stripped):
+        return True
+
+    return False
+
+
+# ============================================================================
+# Literal value detection — determines if an entity name should be a value, not a node
+# ============================================================================
+
+
+def is_literal_value(name: str) -> bool:
+    """Check if an entity name is a literal value that should be a property, not a graph node.
+
+    Reuses the existing detection functions for numeric values, codes, and dates.
+    These should be stored as properties on their subject entity rather than
+    becoming standalone nodes in the knowledge graph.
+
+    Returns True for:
+    - Numeric values with units (3000元, 0.160ng/ml, 50%)
+    - Pure number strings (000333, 5736)
+    - Codes and IDs (6222080200008516588, 19220010031)
+    - Date/time expressions (2024年3月, 2024-01-30)
+
+    Returns False for:
+    - Named entities (张三, 华为技术有限公司)
+    - Phone numbers (they have real-world meaning)
+    """
+    if not name or not name.strip():
+        return True  # empty strings are not meaningful entities
+
+    # Phone numbers have real-world meaning — keep them as entities
+    if _PHONE_RE.match(name.strip()):
+        return False
+
+    return (
+        _is_numeric_dominant(name)
+        or _looks_like_code(name)
+        or _looks_like_date(name)
+    )
+
+
+# ============================================================================
 # Entity quality check — main entry point
 # ============================================================================
 
@@ -331,13 +539,42 @@ def check_entity(
             flags.append("image_source")
             is_image_sourced = True
 
-    # Verdict: >=2 flags → suspect.
-    # EXCEPTION: "not_a_word" from an image/OCR source is especially risky
-    # (OCR is the biggest source of gibberish entities).  A single
-    # "not_a_word" flag combined with image or OCR sourcing counts as 2.
+    # Rule 6: Numeric dominant — entities that are mostly numbers/values
+    is_numeric = _is_numeric_dominant(name)
+    if is_numeric:
+        flags.append("numeric_dominant")
+
+    # Rule 7: Looks like code/ID — long digit strings, alphanumeric codes
+    is_code = _looks_like_code(name)
+    if is_code:
+        flags.append("looks_like_code")
+
+    # Rule 8: Looks like date/time — these are values, not entities
+    is_date = _looks_like_date(name)
+    if is_date:
+        flags.append("looks_like_date")
+
+    # ── Verdict ──
+    # Special combinations that are always suspect (even if only 1 flag):
+    # - numeric_dominant + isolated → meaningless value with no connections
+    # - looks_like_code + isolated → random code with no graph context
+    # - not_a_word + OCR/image source → OCR gibberish (existing rule)
     is_ocr_or_image = is_ocr_sourced or is_image_sourced
+
     if "not_a_word" in flags and is_ocr_or_image:
         is_suspect = True  # Harsh: bad word from OCR/image = always suspect
+    elif "numeric_dominant" in flags and "isolated" in flags:
+        is_suspect = True  # Isolated numeric values are almost always garbage
+    elif "looks_like_code" in flags and "isolated" in flags:
+        is_suspect = True  # Isolated codes with no graph context
+    elif "looks_like_date" in flags and "isolated" in flags:
+        is_suspect = True  # Dates should be values, not graph nodes
+    elif "numeric_dominant" in flags and "isolated" in flags:
+        is_suspect = True  # Isolated numeric values are almost always garbage
+    elif "looks_like_date" in flags and len(flags) >= 2:
+        is_suspect = True  # Date + any other flag = suspect
+    elif "numeric_dominant" in flags and len(flags) >= 2:
+        is_suspect = True  # numeric + anything else (e.g. too_short, too_long)
     else:
         is_suspect = len(flags) >= 2
 
@@ -357,6 +594,12 @@ def check_entity(
         reason_parts.append("仅出现在OCR恢复文件中")
     if "image_source" in flags:
         reason_parts.append("来源为图片文件（OCR识别）")
+    if "numeric_dominant" in flags:
+        reason_parts.append("数字/数值占主导（可能为检验值、金额等）")
+    if "looks_like_code" in flags:
+        reason_parts.append("疑似代码/ID（长数字串或字母数字混合码）")
+    if "looks_like_date" in flags:
+        reason_parts.append("疑似日期/时间（应为属性值而非实体）")
 
     return {
         "entity": name,

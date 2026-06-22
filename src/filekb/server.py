@@ -1634,6 +1634,101 @@ def suspect_revert_endpoint(proposal_id: int, request: Request, kb: str = Query(
 
 
 # ============================================================================
+# Entity management — list & batch operations
+# ============================================================================
+
+
+class EntityBatchRequest(BaseModel):
+    kb: str = Field(default="默认")
+    operations: list[dict]  # [{"action": "rename", "entity": "...", "new_name": "..."}, {"action": "delete", "entity": "..."}]
+
+
+@app.get("/entities/list")
+def entity_list_endpoint(
+    request: Request,
+    kb: str = Query(default="默认"),
+    search: str | None = Query(default=None, description="Filter by entity name substring"),
+    sort_by: str = Query(default="count", description="count | name | degree"),
+    order: str = Query(default="desc", description="asc | desc"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    suspect_only: bool = Query(default=False),
+    merge_proposal_only: bool = Query(default=False),
+):
+    """List all entities with occurrence counts and metadata."""
+    kb = _resolve_kb(request, kb)
+    store = _kb_store(request, kb)
+
+    entities, total = store.list_entities_with_stats(
+        search=search,
+        sort_by=sort_by,
+        order=order,
+        page=page,
+        page_size=page_size,
+        suspect_only=suspect_only,
+        merge_proposal_only=merge_proposal_only,
+    )
+
+    return {
+        "entities": entities,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.post("/entities/batch")
+def entity_batch_endpoint(req: EntityBatchRequest, request: Request):
+    """Execute batch entity rename/delete operations and rebuild graph.
+
+    All operations run in a single transaction. After completion, the
+    knowledge graph is rebuilt from the updated facts table.
+    """
+    kb = _resolve_kb(request, req.kb)
+    store = _kb_store(request, kb)
+    gs = _kb_gs(request, kb)
+
+    if not req.operations:
+        raise HTTPException(400, "operations list cannot be empty")
+
+    logger.info("Batch entity ops for KB '%s': %d operations", kb, len(req.operations))
+
+    # Execute batch operations
+    results = store.batch_entity_operations(req.operations)
+
+    # Rebuild graph from updated facts
+    facts = store.conn.execute(
+        "SELECT id, subject, predicate, object, confidence FROM facts WHERE status = 'active'"
+    ).fetchall()
+    gs.rebuild_from_facts([dict(f) for f in facts])
+
+    # Re-run suspect detection to clear resolved proposals
+    entity_suspects = 0
+    try:
+        from filekb.personalization import generate_suspect_proposals
+        suspects = generate_suspect_proposals(store, gs)
+        entity_suspects = len(suspects)
+    except Exception as e:
+        logger.warning("Suspect re-scan after batch ops failed: %s", e)
+
+    success_count = sum(1 for r in results if r.get("success"))
+    logger.info(
+        "Batch entity ops done: %d/%d succeeded, graph rebuilt (%d nodes, %d edges), %d suspects found",
+        success_count, len(results),
+        gs.node_count, gs.edge_count, entity_suspects,
+    )
+
+    return {
+        "status": "ok",
+        "results": results,
+        "graph_rebuilt": True,
+        "graph_nodes": gs.node_count,
+        "graph_edges": gs.edge_count,
+        "suspects_found": entity_suspects,
+    }
+
+
+# ============================================================================
 # GET /dlq — Dead Letter Queue status + entries
 # ============================================================================
 
